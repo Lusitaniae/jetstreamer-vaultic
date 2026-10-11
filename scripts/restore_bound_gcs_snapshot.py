@@ -240,7 +240,7 @@ def describe_remote_snapshot(
     billing_project: str,
     expected_size: int,
     expected_crc32c: str,
-    expected_md5: str,
+    expected_md5: str | None,
 ) -> dict[str, Any]:
     match = VERSIONED_URI.fullmatch(versioned_uri)
     if match is None:
@@ -292,7 +292,19 @@ def describe_remote_snapshot(
     # Homebrew gcloud normalizes these fields. Accept either spelling but fail
     # closed if a response happens to contain inconsistent aliases.
     actual_crc32c = aliased_hash("crc32c", "crc32c_hash", 4, "remote CRC32C")
-    actual_md5 = aliased_hash("md5Hash", "md5_hash", 16, "remote MD5")
+    md5_values = [
+        metadata[name]
+        for name in ("md5Hash", "md5_hash")
+        if name in metadata
+    ]
+    if expected_md5 is None:
+        if any(value is not None for value in md5_values):
+            raise RestoreError(
+                "remote snapshot metadata unexpectedly contains MD5 for a sealed composite object"
+            )
+        actual_md5 = None
+    else:
+        actual_md5 = aliased_hash("md5Hash", "md5_hash", 16, "remote MD5")
     if actual_crc32c != expected_crc32c or actual_md5 != expected_md5:
         raise RestoreError("remote snapshot metadata hashes do not match sealed expectations")
     expected_id = f"{ALLOWED_BUCKET}/{object_name}/{generation_text}"
@@ -321,7 +333,8 @@ def validate_file(
     path: Path,
     expected_size: int,
     expected_crc32c: str,
-    expected_md5: str,
+    expected_md5: str | None,
+    expected_sha256: str | None = None,
 ) -> dict[str, Any]:
     try:
         metadata = path.lstat()
@@ -337,6 +350,7 @@ def validate_file(
         )
     before = (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns)
     actual_crc32c, actual_md5 = local_hashes(gcloud, path)
+    actual_sha256 = sha256_file(path)
     after_metadata = path.lstat()
     after = (
         after_metadata.st_dev,
@@ -350,9 +364,13 @@ def validate_file(
         raise RestoreError(
             f"restored snapshot CRC32C mismatch: expected {expected_crc32c}, got {actual_crc32c}"
         )
-    if actual_md5 != expected_md5:
+    if expected_md5 is not None and actual_md5 != expected_md5:
         raise RestoreError(
             f"restored snapshot MD5 mismatch: expected {expected_md5}, got {actual_md5}"
+        )
+    if expected_sha256 is not None and actual_sha256 != expected_sha256:
+        raise RestoreError(
+            f"restored snapshot SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
         )
     return {
         "device": after_metadata.st_dev,
@@ -363,6 +381,7 @@ def validate_file(
         "uid": after_metadata.st_uid,
         "crc32c_base64": actual_crc32c,
         "md5_base64": actual_md5,
+        "sha256": actual_sha256,
     }
 
 
@@ -417,7 +436,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--destination", type=Path, required=True)
     parser.add_argument("--expected-size", type=int, required=True)
     parser.add_argument("--expected-crc32c", required=True)
-    parser.add_argument("--expected-md5", required=True)
+    md5 = parser.add_mutually_exclusive_group(required=True)
+    md5.add_argument("--expected-md5")
+    md5.add_argument(
+        "--expect-no-md5",
+        action="store_true",
+        help="require generation metadata to omit MD5 for a sealed GCS composite object",
+    )
+    parser.add_argument("--expected-sha256")
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--filesystem", type=Path, required=True)
     parser.add_argument("--minimum-free-bytes", type=int, required=True)
@@ -441,7 +467,16 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         if args.minimum_free_bytes < 1:
             raise RestoreError("minimum free bytes must be positive")
         args.expected_crc32c = canonical_base64(args.expected_crc32c, 4, "expected CRC32C")
-        args.expected_md5 = canonical_base64(args.expected_md5, 16, "expected MD5")
+        if args.expect_no_md5:
+            args.expected_md5 = None
+        else:
+            args.expected_md5 = canonical_base64(
+                args.expected_md5, 16, "expected MD5"
+            )
+        if args.expected_sha256 is not None and re.fullmatch(
+            r"[0-9a-f]{64}", args.expected_sha256
+        ) is None:
+            raise RestoreError("expected SHA-256 must be exactly 64 lowercase hex characters")
         if not args.destination.is_absolute() or args.destination.name != filename:
             raise RestoreError("destination must be absolute and preserve the bound snapshot filename")
         args.destination_parent = require_private_directory(
@@ -487,6 +522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.expected_size,
             args.expected_crc32c,
             args.expected_md5,
+            args.expected_sha256,
         )
         source = "preexisting-verified"
     else:
@@ -510,6 +546,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.expected_size,
                 args.expected_crc32c,
                 args.expected_md5,
+                args.expected_sha256,
             )
             fsync_file_and_directory(temporary)
             require_free_space(args.filesystem, args.minimum_free_bytes)
@@ -522,6 +559,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.expected_size,
                     args.expected_crc32c,
                     args.expected_md5,
+                    args.expected_sha256,
                 )
                 source = "concurrent-verified-publication"
 

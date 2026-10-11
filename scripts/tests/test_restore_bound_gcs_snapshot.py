@@ -176,6 +176,46 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
                 md5,
             )
 
+    @patch("scripts.restore_bound_gcs_snapshot.run_checked")
+    def test_remote_description_accepts_explicit_composite_without_md5(
+        self, run_checked: object
+    ) -> None:
+        crc = base64.b64encode(b"1234").decode()
+        object_name = f"87263434/{FILENAME}"
+        metadata = {
+            "bucket": restore.ALLOWED_BUCKET,
+            "name": object_name,
+            "generation": "1634789740125991",
+            "size": 8081511792,
+            "crc32c_hash": crc,
+            "md5_hash": None,
+            "storage_url": URI,
+        }
+        run_checked.return_value = SimpleNamespace(stdout=json.dumps(metadata))
+        result = restore.describe_remote_snapshot(
+            Path("/usr/bin/gcloud"),
+            URI,
+            "user@example.com",
+            "principal-lane-200702",
+            8081511792,
+            crc,
+            None,
+        )
+        self.assertIsNone(result["md5_base64"])
+
+        metadata["md5_hash"] = base64.b64encode(b"1234567890123456").decode()
+        run_checked.return_value.stdout = json.dumps(metadata)
+        with self.assertRaisesRegex(restore.RestoreError, "unexpectedly contains MD5"):
+            restore.describe_remote_snapshot(
+                Path("/usr/bin/gcloud"),
+                URI,
+                "user@example.com",
+                "principal-lane-200702",
+                8081511792,
+                crc,
+                None,
+            )
+
     def test_canonical_base64_rejects_non_strings(self) -> None:
         for invalid in (None, 1, b"MTIzNA=="):
             with self.subTest(invalid=invalid), self.assertRaises(restore.RestoreError):
@@ -326,10 +366,22 @@ class BoundGcsSnapshotRestoreTest(unittest.TestCase):
             path = Path(directory) / "snapshot"
             path.write_bytes(b"payload")
             os.chmod(path, 0o600)
-            details = restore.validate_file(Path("/gcloud"), path, 7, crc, md5)
+            sha256 = restore.sha256_file(path)
+            details = restore.validate_file(
+                Path("/gcloud"), path, 7, crc, md5, sha256
+            )
             self.assertEqual(details["size"], 7)
+            self.assertEqual(details["sha256"], sha256)
             with self.assertRaisesRegex(restore.RestoreError, "size mismatch"):
                 restore.validate_file(Path("/gcloud"), path, 8, crc, md5)
+
+            with self.assertRaisesRegex(restore.RestoreError, "SHA-256 mismatch"):
+                restore.validate_file(Path("/gcloud"), path, 7, crc, md5, "0" * 64)
+
+            wrong_md5 = base64.b64encode(b"6543210987654321").decode()
+            hashes.return_value = (crc, wrong_md5)
+            details = restore.validate_file(Path("/gcloud"), path, 7, crc, None)
+            self.assertEqual(details["md5_base64"], wrong_md5)
 
 
 if __name__ == "__main__":
