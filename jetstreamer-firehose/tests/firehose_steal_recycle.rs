@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use cid::Cid;
 use futures_util::FutureExt;
