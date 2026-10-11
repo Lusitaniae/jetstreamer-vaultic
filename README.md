@@ -567,7 +567,7 @@ select a runtime. The current registry is deliberately conservative:
 | `92,448,000..93,312,000` | pinned Solana v1.6.17 worker | independently restarted from canonical snapshot slot 92,447,542; that destination worker owns only the exact 457-slot pre-output warmup; exact upstream tag identity and terminal root at slot 93,311,535 remain checkpoint-gated | unqualified diagnostic candidate for epochs 214-215 |
 | `93,312,000..100,656,000` | pinned Solana v1.6.20 worker | independently restarted from canonical snapshot slot 93,311,535; that destination worker owns only the exact 464-slot pre-output warmup and every cohort remains canonical-root-gated | unqualified diagnostic candidate for epochs 216-232 |
 | `100,656,000..114,912,000` | pinned Solana v1.7.15 worker | independently restarted from canonical snapshot slot 100,655,540; owns the exact 459-slot pre-output warmup and remains canonical-root-gated | unqualified diagnostic candidate for epochs 233-265 |
-| `114,912,000..130,464,000` | pinned Solana v1.8.11 worker | independently restarted from canonical snapshot slot 114,910,768; owns the exact 1,231-slot pre-output warmup; epochs 266-301 are the current publication range | unqualified diagnostic candidate for epochs 266-301 |
+| `114,912,000..130,464,000` | pinned Solana v1.8.11 worker | independently restarted from canonical snapshot slot 114,910,768; owns the exact 1,231-slot pre-output warmup; epochs 266-300 are the publication range and epoch 301 is the private verification tail | unqualified diagnostic candidate for epochs 266-301 |
 | `130,464,000..406,080,000` | none | unsupported; replay fails closed | unsupported |
 | `406,080,000..` | in-process Agave v3 | independently verified modern snapshot bootstrap | verified |
 
@@ -596,13 +596,14 @@ limited to epochs 214-215; the preceding gap remains unsupported.
 The independently restarted v1.6.20 worker is bounded to epochs 216-232.
 Exact v1.7.13 remains an unassigned fallback comparison candidate. The primary
 v1.7.15 envelope covers epochs 233-265, and v1.8.11 covers the complete
-epoch-266-301 publication range.
+epoch-266-301 execution envelope, with publication ending at epoch 300 and epoch 301 retained as
+the private verification tail.
 
 The final sealed root cohort replays epochs 298-301 in a private lane. A fresh campaign manifest
-must bind `--last-epoch=301 --publish-through-epoch=301`; after all four archives and the epoch-301
-root gate pass, its importer may transactionally publish epochs 298-301. The older immutable
-manifest capped at epoch 300 remains valid only for its original private-tail policy and must not
-be reused to publish epoch 301.
+must bind `--last-epoch=301 --publish-through-epoch=300`; after all four archives and the epoch-301
+root gate pass, its importer may transactionally publish only epochs 298-300. Epoch 301 remains
+private and sidecar-free and must never be placed in the public Horizon directory or uploaded to
+R2 by this campaign.
 
 Before a completed focused artifact is used as registry evidence, independently revalidate it with
 `cargo run --release -p jetstreamer-node --bin jetstreamer-qualification-verify -- ...`. The

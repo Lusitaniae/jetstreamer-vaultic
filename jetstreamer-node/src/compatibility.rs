@@ -199,7 +199,8 @@ pub const SOLANA_V1_7_15_INITIAL_REPLAY_SLOT: Slot = SOLANA_V1_7_15_INITIAL_SNAP
 pub const SOLANA_V1_7_15_CANDIDATE_START_SLOT: Slot = SOLANA_V1_6_20_CANDIDATE_END_SLOT_EXCLUSIVE;
 pub const SOLANA_V1_7_15_CANDIDATE_END_SLOT_EXCLUSIVE: Slot = 114_912_000;
 /// Canonical epoch-265 root that bootstraps the independently restarted
-/// v1.8.11 envelope through the campaign publication boundary at epoch 301.
+/// v1.8.11 envelope through private verification-tail epoch 301; campaign
+/// publication ends at epoch 300.
 pub const SOLANA_V1_8_11_INITIAL_SNAPSHOT_SLOT: Slot = 114_910_768;
 pub const SOLANA_V1_8_11_INITIAL_REPLAY_SLOT: Slot = SOLANA_V1_8_11_INITIAL_SNAPSHOT_SLOT + 1;
 pub const SOLANA_V1_8_11_CANDIDATE_START_SLOT: Slot = SOLANA_V1_7_15_CANDIDATE_END_SLOT_EXCLUSIVE;
