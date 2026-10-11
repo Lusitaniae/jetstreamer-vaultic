@@ -14,7 +14,7 @@ exclude = ["historical-runtime"]
 
 [workspace.package]
 edition = "2024"
-version = "0.7.0"
+version = "0.8.1"
 authors = ["sam0x17", "anza-team"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/anza-xyz/jetstreamer"
@@ -38,11 +38,11 @@ s3-backend = ["jetstreamer-firehose/s3-backend"]
 verify-transaction-signatures = ["jetstreamer-firehose/verify-transaction-signatures"]
 
 [workspace.dependencies]
-jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.7.0" }
-jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.7.0" }
-jetstreamer-utils = { path = "jetstreamer-utils", version = "0.7.0" }
-jetstreamer-node = { path = "jetstreamer-node", version = "0.7.0" }
-jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.7.0" }
+jetstreamer-firehose = { path = "jetstreamer-firehose", version = "0.8.1" }
+jetstreamer-plugin = { path = "jetstreamer-plugin", version = "0.8.1" }
+jetstreamer-utils = { path = "jetstreamer-utils", version = "0.8.1" }
+jetstreamer-node = { path = "jetstreamer-node", version = "0.8.1" }
+jetstreamer-horizon = { path = "jetstreamer-horizon", version = "0.8.1" }
 tokio = "1"
 futures-util = { version = "0", default-features = false }
 futures = "0"
@@ -121,7 +121,7 @@ lz4 = "1.28"
 thousands = "0"
 tokio-stream = { version = "0", default-features = false }
 rangemap = "1"
-rseek = "0.4"
+rseek = "0.4.1"
 ripget = "0.3"
 rayon = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
