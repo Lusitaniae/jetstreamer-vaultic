@@ -186,6 +186,105 @@ class ReserveStoppedScratchRetirementTest(unittest.TestCase):
             finally:
                 package.chmod(0o700)
 
+    def test_external_cached_bootstrap_schema_is_strictly_bound(self) -> None:
+        with tempfile.TemporaryDirectory(dir=".") as raw:
+            root = Path(raw).resolve()
+            args, run = self.make_run(root)
+            (run / "inputs" / "snapshot.tar.zst").unlink()
+            package = root / "cached-package"
+            package.mkdir()
+            bootstrap = package / "snapshot-123.tar.zst"
+            node = package / "jetstreamer-node"
+            bootstrap.write_bytes(b"sealed cached bootstrap")
+            node.write_bytes(b"sealed cached node")
+            bootstrap.chmod(0o444)
+            node.chmod(0o555)
+            bootstrap_sha256 = hashlib.sha256(bootstrap.read_bytes()).hexdigest()
+            node_sha256 = hashlib.sha256(node.read_bytes()).hexdigest()
+            manifest = {
+                "schema": retire.CACHED_CONTIGUOUS_DEPLOYMENT_SCHEMA,
+                "cohort": {
+                    "first_epoch": 186,
+                    "last_epoch": 186,
+                    "continuous_replay": True,
+                    "runtime": "solana-v1.6.20",
+                },
+                "preflight": {"manifest_fingerprint": FINGERPRINT},
+                "parent": {
+                    "path": node.name,
+                    "sha256": node_sha256,
+                },
+                "bootstrap": {
+                    "path": bootstrap.name,
+                    "bytes": bootstrap.stat().st_size,
+                    "sha256": bootstrap_sha256,
+                    "sealed_direct_member": True,
+                    "gcloud_download_required": False,
+                },
+                "publication_authorized": False,
+                "remote_mutations": False,
+                "r2_mutations": False,
+            }
+            manifest_path = package / "deployment-manifest.json"
+            sums = package / "SHA256SUMS"
+
+            def seal_manifest() -> None:
+                package.chmod(0o700)
+                for path in (manifest_path, sums):
+                    if path.exists():
+                        path.chmod(0o600)
+                manifest_path.write_text(json.dumps(manifest))
+                manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+                sums.write_text(
+                    f"{manifest_sha256}  deployment-manifest.json\n"
+                    f"{node_sha256}  jetstreamer-node\n"
+                    f"{bootstrap_sha256}  {bootstrap.name}\n"
+                )
+                manifest_path.chmod(0o444)
+                sums.chmod(0o444)
+                package.chmod(0o555)
+
+            args.producer_unit = "producer.service"
+            args.retained_external_bootstrap = bootstrap
+            properties = (
+                "ExecStart={ path=/sealed/node ; argv[]=/sealed/node "
+                f"--snapshot-archive={bootstrap} ; }}\n"
+                "Environment=JETSTREAMER_CLEAR_ACCOUNTS_ON_START=true\n"
+            )
+            try:
+                seal_manifest()
+                with mock.patch.object(
+                    retire.subprocess, "check_output", return_value=properties
+                ):
+                    external = retire.validate_retained_external_bootstrap(
+                        args, expected_uid=os.getuid()
+                    )
+                self.assertEqual(
+                    external["deployment_manifest_schema"],
+                    retire.CACHED_CONTIGUOUS_DEPLOYMENT_SCHEMA,
+                )
+
+                manifest["bootstrap"]["sealed_direct_member"] = False
+                seal_manifest()
+                with self.assertRaisesRegex(
+                    retire.RetirementError, "does not bind this cohort"
+                ):
+                    retire.validate_retained_external_bootstrap(
+                        args, expected_uid=os.getuid()
+                    )
+
+                manifest["bootstrap"]["sealed_direct_member"] = True
+                manifest["parent"]["sha256"] = "f" * 64
+                seal_manifest()
+                with self.assertRaisesRegex(
+                    retire.RetirementError, "hash binding failed"
+                ):
+                    retire.validate_retained_external_bootstrap(
+                        args, expected_uid=os.getuid()
+                    )
+            finally:
+                package.chmod(0o700)
+
     def test_exact_delete_preserves_run_evidence(self) -> None:
         with tempfile.TemporaryDirectory(dir=".") as raw:
             args, run = self.make_run(Path(raw).resolve())

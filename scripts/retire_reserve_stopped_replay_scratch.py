@@ -30,6 +30,10 @@ GUARD_COMPLETION_SCHEMA = "jetstreamer-adaptive-replay-reserve-stop-completion-v
 RUN_STATE_SCHEMA = "jetstreamer-root-cohort-run-v1"
 INTENT_SCHEMA = "jetstreamer-reserve-stopped-scratch-retirement-intent-v1"
 COMPLETION_SCHEMA = "jetstreamer-reserve-stopped-scratch-retirement-completion-v1"
+CONTIGUOUS_DEPLOYMENT_SCHEMA = "jetstreamer-private-contiguous-deployment-v1"
+CACHED_CONTIGUOUS_DEPLOYMENT_SCHEMA = (
+    "jetstreamer-private-contiguous-runtime-cached-deployment-v1"
+)
 UNIT_NAME = re.compile(r"^[A-Za-z0-9_.@-]+\.service$")
 INVOCATION_ID = re.compile(r"^[0-9a-f]{32}$")
 FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -173,24 +177,63 @@ def validate_retained_external_bootstrap(
     bootstrap_manifest = manifest.get("bootstrap")
     bootstrap_size = None
     if isinstance(bootstrap_manifest, dict):
-        size_bytes = bootstrap_manifest.get("size_bytes")
-        size_alias = bootstrap_manifest.get("size")
-        if size_bytes is not None and size_alias is not None and size_bytes != size_alias:
+        size_values = [
+            bootstrap_manifest[key]
+            for key in ("size_bytes", "size", "bytes")
+            if key in bootstrap_manifest
+        ]
+        if size_values and any(value != size_values[0] for value in size_values[1:]):
             raise RetirementError("bootstrap deployment manifest has conflicting size aliases")
-        bootstrap_size = size_bytes if size_bytes is not None else size_alias
-    if (
-        manifest.get("schema") != "jetstreamer-private-contiguous-deployment-v1"
-        or not isinstance(bootstrap_manifest, dict)
-        or bootstrap_manifest.get("filename") != bootstrap.name
-        or bootstrap_size != bootstrap_metadata.st_size
-        or SHA256.fullmatch(str(bootstrap_manifest.get("sha256", ""))) is None
-        or SHA256.fullmatch(str(manifest.get("parent_sha256", ""))) is None
-        or manifest.get("manifest_fingerprint") != args.manifest_fingerprint
-        or manifest.get("range") != [args.start_epoch, args.end_epoch]
-        or bootstrap_manifest.get("path", str(bootstrap)) != str(bootstrap)
-        or bootstrap_manifest.get("epochs", [args.start_epoch, args.end_epoch])
-        != [args.start_epoch, args.end_epoch]
-    ):
+        bootstrap_size = size_values[0] if size_values else None
+
+    schema = manifest.get("schema")
+    parent_sha256 = None
+    manifest_binds_cohort = False
+    if schema == CONTIGUOUS_DEPLOYMENT_SCHEMA:
+        parent_sha256 = manifest.get("parent_sha256")
+        manifest_binds_cohort = (
+            isinstance(bootstrap_manifest, dict)
+            and bootstrap_manifest.get("filename") == bootstrap.name
+            and bootstrap_size == bootstrap_metadata.st_size
+            and SHA256.fullmatch(str(bootstrap_manifest.get("sha256", "")))
+            is not None
+            and SHA256.fullmatch(str(parent_sha256 or "")) is not None
+            and manifest.get("manifest_fingerprint") == args.manifest_fingerprint
+            and manifest.get("range") == [args.start_epoch, args.end_epoch]
+            and bootstrap_manifest.get("path", str(bootstrap)) == str(bootstrap)
+            and bootstrap_manifest.get(
+                "epochs", [args.start_epoch, args.end_epoch]
+            )
+            == [args.start_epoch, args.end_epoch]
+        )
+    elif schema == CACHED_CONTIGUOUS_DEPLOYMENT_SCHEMA:
+        cohort = manifest.get("cohort")
+        preflight = manifest.get("preflight")
+        parent = manifest.get("parent")
+        if isinstance(parent, dict):
+            parent_sha256 = parent.get("sha256")
+        manifest_binds_cohort = (
+            isinstance(bootstrap_manifest, dict)
+            and isinstance(cohort, dict)
+            and isinstance(preflight, dict)
+            and isinstance(parent, dict)
+            and bootstrap_manifest.get("path") == bootstrap.name
+            and bootstrap_manifest.get("sealed_direct_member") is True
+            and bootstrap_manifest.get("gcloud_download_required") is False
+            and bootstrap_size == bootstrap_metadata.st_size
+            and SHA256.fullmatch(str(bootstrap_manifest.get("sha256", "")))
+            is not None
+            and cohort.get("first_epoch") == args.start_epoch
+            and cohort.get("last_epoch") == args.end_epoch
+            and cohort.get("continuous_replay") is True
+            and preflight.get("manifest_fingerprint") == args.manifest_fingerprint
+            and parent.get("path") == node_path.name
+            and SHA256.fullmatch(str(parent_sha256 or "")) is not None
+            and manifest.get("publication_authorized") is False
+            and manifest.get("remote_mutations") is False
+            and manifest.get("r2_mutations") is False
+        )
+    if not manifest_binds_cohort:
         raise RetirementError("bootstrap deployment manifest does not bind this cohort")
     sums = parse_sha256sums(sums_path)
     manifest_sha256 = hash_stable(manifest_path, manifest_metadata)
@@ -201,7 +244,7 @@ def validate_retained_external_bootstrap(
         or sums.get(bootstrap.name) != bootstrap_sha256
         or sums.get("jetstreamer-node") != node_sha256
         or bootstrap_manifest["sha256"] != bootstrap_sha256
-        or manifest["parent_sha256"] != node_sha256
+        or parent_sha256 != node_sha256
     ):
         raise RetirementError("immutable bootstrap package hash binding failed")
 
@@ -236,6 +279,7 @@ def validate_retained_external_bootstrap(
         "mode": f"{stat.S_IMODE(bootstrap_metadata.st_mode):04o}",
         "sha256": bootstrap_sha256,
         "deployment_manifest": str(manifest_path),
+        "deployment_manifest_schema": schema,
         "deployment_manifest_sha256": manifest_sha256,
         "sha256sums": str(sums_path),
         "sha256sums_sha256": hash_stable(sums_path, sums_metadata),
