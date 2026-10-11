@@ -2,6 +2,8 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
@@ -12,6 +14,17 @@ from scripts import refresh_idle_gcloud_lane_configs as refresh
 
 
 class IdleGCloudRefreshTests(unittest.TestCase):
+    def test_direct_cli_help_is_cwd_independent(self) -> None:
+        with TemporaryDirectory() as temporary:
+            completed = subprocess.run(
+                [sys.executable, str(Path(refresh.__file__).resolve()), "--help"],
+                cwd=temporary,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def probe(self) -> dict:
         return {
             "versioned_uri": "gs://bucket/object#123",

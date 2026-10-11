@@ -17,7 +17,10 @@ import sys
 from types import ModuleType
 from typing import Any, Sequence
 
-from scripts import retire_reboot_interrupted_replay_scratch as base
+if __package__:
+    from scripts import retire_reboot_interrupted_replay_scratch as base
+else:
+    import retire_reboot_interrupted_replay_scratch as base
 
 
 PLAN_SCHEMA = "jetstreamer-recovered-controller-command-plan-v1"

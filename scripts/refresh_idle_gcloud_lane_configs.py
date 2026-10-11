@@ -24,7 +24,10 @@ import subprocess
 import sys
 from typing import Any, Iterable, Sequence
 
-from scripts import retire_reboot_interrupted_replay_scratch as base
+if __package__:
+    from scripts import retire_reboot_interrupted_replay_scratch as base
+else:
+    import retire_reboot_interrupted_replay_scratch as base
 
 
 PLAN_SCHEMA = "jetstreamer-idle-gcloud-refresh-plan-v2"

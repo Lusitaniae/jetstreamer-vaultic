@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
+import subprocess
 from subprocess import CompletedProcess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -9,6 +11,17 @@ from scripts import retire_auth_failed_replay_scratch as retire
 
 
 class AuthFailedScratchRetirementTests(unittest.TestCase):
+    def test_direct_cli_help_is_cwd_independent(self) -> None:
+        with TemporaryDirectory() as temporary:
+            completed = subprocess.run(
+                [sys.executable, str(Path(retire.__file__).resolve()), "--help"],
+                cwd=temporary,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
     def make_run(self, root: Path, start: int = 159, end: int = 162) -> tuple[Path, dict]:
         run = root / "work" / f"root-cohort-{start}-{end}" / "run-12-34"
         run.mkdir(parents=True, mode=0o700)
