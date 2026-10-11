@@ -1990,6 +1990,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
+    #[ignore = "requires live Old Faithful network access"]
     async fn test_epoch_800_hydration_time() {
         init_logger();
         SLOT_OFFSET_RESULT_CACHE.clear();
@@ -2081,6 +2082,7 @@ mod tests {
     /// legacy fallback path derives byte ranges identical to the slot-ranges index.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[serial_test::serial]
+    #[ignore = "requires live Old Faithful network access"]
     async fn test_epoch_800_legacy_matches_slot_ranges() {
         init_logger();
         SLOT_OFFSET_RESULT_CACHE.clear();

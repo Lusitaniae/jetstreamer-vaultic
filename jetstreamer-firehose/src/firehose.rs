@@ -4441,6 +4441,7 @@ async fn log_slot_node_summary(slot: u64) -> Result<(), SharedError> {
     Ok(())
 }
 
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_800() {
     use dashmap::DashSet;
@@ -4556,6 +4557,7 @@ async fn test_firehose_epoch_800() {
     assert!(NUM_BLOCKS.load(Ordering::Relaxed) > 0);
 }
 
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_target_slot_transactions() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -4638,6 +4640,7 @@ async fn test_firehose_target_slot_transactions() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactions() {
     use std::sync::{
@@ -4711,6 +4714,7 @@ async fn test_firehose_epoch_900_boundary_window_sequential_monotonic_transactio
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_720_slot_311173980_solscan_non_vote_counts() {
     solana_logger::setup_with_default("info");
@@ -4719,6 +4723,7 @@ async fn test_firehose_epoch_720_slot_311173980_solscan_non_vote_counts() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_720_slot_311225232_solscan_non_vote_counts() {
     solana_logger::setup_with_default("info");
@@ -4727,6 +4732,7 @@ async fn test_firehose_epoch_720_slot_311225232_solscan_non_vote_counts() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_720_slot_311175860_solscan_non_vote_counts() {
     solana_logger::setup_with_default("info");
@@ -4735,6 +4741,7 @@ async fn test_firehose_epoch_720_slot_311175860_solscan_non_vote_counts() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_720_slot_311134608_solscan_non_vote_counts() {
     solana_logger::setup_with_default("info");
@@ -4742,7 +4749,7 @@ async fn test_firehose_epoch_720_slot_311134608_solscan_non_vote_counts() {
 }
 
 #[cfg(test)]
-#[ignore]
+#[ignore = "requires live Old Faithful network access"]
 #[serial]
 #[tokio::test(flavor = "multi_thread")]
 async fn debug_epoch_720_slot_311173980_node_summary() {
@@ -4759,6 +4766,7 @@ async fn debug_epoch_720_slot_311173980_node_summary() {
     }
 }
 
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_850_has_logs() {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -4802,6 +4810,7 @@ async fn test_firehose_epoch_850_has_logs() {
     );
 }
 
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_epoch_850_votes_present() {
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -4869,6 +4878,7 @@ async fn test_firehose_epoch_850_votes_present() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_restart_loses_coverage_without_reset() {
     use std::collections::HashMap;
@@ -4938,6 +4948,7 @@ async fn test_firehose_restart_loses_coverage_without_reset() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_retries_failed_skipped_slot_callback() {
     use std::collections::HashMap;
@@ -4998,6 +5009,7 @@ async fn test_firehose_retries_failed_skipped_slot_callback() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_gap_coverage_near_known_missing_range() {
     use std::collections::HashSet;
@@ -5073,6 +5085,7 @@ async fn test_firehose_gap_coverage_near_known_missing_range() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_sequential_carries_parent_hash_across_epoch_boundary() {
     use std::sync::{Arc, Mutex};
@@ -5175,6 +5188,7 @@ fn test_seeded_geyser_requires_sequential_mode() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[test]
 fn test_seeded_geyser_propagates_initial_parent_mismatch() {
     let runtime = Arc::new(tokio::runtime::Runtime::new().expect("runtime"));
@@ -5210,6 +5224,7 @@ fn test_seeded_geyser_propagates_initial_parent_mismatch() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_sequential_reverse_crosses_epoch_boundary() {
     use std::sync::{
@@ -5316,6 +5331,7 @@ async fn test_firehose_sequential_reverse_crosses_epoch_boundary() {
 
 #[cfg(test)]
 #[serial]
+#[ignore = "requires live Old Faithful network access"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_firehose_reverse_implies_sequential() {
     use std::sync::{
