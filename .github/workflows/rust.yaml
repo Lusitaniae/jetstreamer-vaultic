@@ -40,6 +40,12 @@ jobs:
   cargo-test:
     name: cargo test
     runs-on: ubuntu-22.04
+    env:
+      # GitHub-hosted runners have much less disk and memory than the former
+      # 8-core custom runners. Debug symbols make several test executables
+      # roughly 1 GiB each without changing what the tests exercise.
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     strategy:
       fail-fast: false
       matrix:
