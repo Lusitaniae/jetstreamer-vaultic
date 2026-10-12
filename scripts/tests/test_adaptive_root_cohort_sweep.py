@@ -983,6 +983,88 @@ class CommandTests(unittest.TestCase):
             f"{self.deploy}:{self.deploy}:rbind",
         )
 
+    def test_producer_binds_only_external_bootstrap_member_read_only(self) -> None:
+        bootstrap = Path("/sealed/bootstrap-source/snapshot-123-Hash.tar.zst")
+        command = sweep.build_producer_command(
+            cohort=self.cohort,
+            lane=self.lane,
+            deploy=self.deploy,
+            manifest=self.manifest,
+            fingerprint=self.fingerprint,
+            unit="external-bootstrap-test.service",
+            cohort_bootstrap=bootstrap,
+        )
+
+        self.assertEqual(command[-1], f"--snapshot-archive={bootstrap}")
+        self.assertEqual(
+            command_properties(command)["BindReadOnlyPaths"],
+            (
+                f"{self.deploy}:{self.deploy}:rbind "
+                f"{bootstrap}:{bootstrap}"
+            ),
+        )
+        self.assertNotIn(
+            f"{bootstrap.parent}:{bootstrap.parent}:rbind",
+            command_properties(command)["BindReadOnlyPaths"],
+        )
+
+    def test_deployment_accepts_exact_member_of_separate_sealed_bootstrap_package(
+        self,
+    ) -> None:
+        bootstrap_deployment = Path("/sealed/bootstrap-source")
+        bootstrap = bootstrap_deployment / "snapshot-123-Hash.tar.zst"
+        main_sums = {
+            "jetstreamer-node": "1" * 64,
+            "jetstreamer-historical-worker-v1-1-23": "2" * 64,
+            self.manifest.name: "3" * 64,
+        }
+        bootstrap_sums = {bootstrap.name: "4" * 64}
+
+        with (
+            mock.patch.object(
+                sweep,
+                "validate_sealed_deployment_directory",
+                side_effect=[self.deploy, bootstrap_deployment],
+            ) as validate_directory,
+            mock.patch.object(
+                sweep,
+                "read_deployment_sums",
+                side_effect=[main_sums, bootstrap_sums],
+            ) as read_sums,
+            mock.patch.object(
+                sweep, "verify_sealed_deployment_member"
+            ) as verify_member,
+        ):
+            result = sweep.verify_deployment(
+                self.deploy,
+                self.manifest,
+                [self.cohort],
+                [bootstrap],
+            )
+
+        self.assertEqual(result, self.deploy)
+        self.assertEqual(
+            validate_directory.call_args_list,
+            [
+                mock.call(self.deploy, "deployment"),
+                mock.call(bootstrap_deployment, "cohort bootstrap deployment"),
+            ],
+        )
+        self.assertEqual(
+            read_sums.call_args_list,
+            [
+                mock.call(self.deploy, "deployment"),
+                mock.call(
+                    bootstrap_deployment, "cohort bootstrap deployment"
+                ),
+            ],
+        )
+        verify_member.assert_any_call(
+            bootstrap,
+            bootstrap_sums,
+            "cohort bootstrap deployment member",
+        )
+
     def test_producer_pins_selected_solana_rayon_threads(self) -> None:
         command = sweep.build_producer_command(
             cohort=self.cohort,

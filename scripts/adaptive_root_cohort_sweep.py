@@ -1048,6 +1048,9 @@ def build_producer_command(
     node = deploy / "jetstreamer-node"
     workers = tuple(deploy / name for _, name in runtime_workers(cohort))
     whole_lane_paths = f"{lane.root}"
+    read_only_bindings = [f"{deploy}:{deploy}:rbind"]
+    if cohort_bootstrap is not None and cohort_bootstrap.parent != deploy:
+        read_only_bindings.append(f"{cohort_bootstrap}:{cohort_bootstrap}")
     properties = (
         "Type=exec",
         "KillMode=control-group",
@@ -1088,7 +1091,7 @@ def build_producer_command(
         f"NoExecPaths={producer_home}",
         f"ExecPaths={node} {' '.join(map(str, workers))} {whole_lane_paths}",
         f"ReadWritePaths={whole_lane_paths}",
-        f"BindReadOnlyPaths={deploy}:{deploy}:rbind",
+        f"BindReadOnlyPaths={' '.join(read_only_bindings)}",
         "InaccessiblePaths="
         + " ".join(f"-{item}" for item in sensitive_paths(producer_home)),
         f"User={producer_user}",
@@ -2613,24 +2616,70 @@ def require_root_controlled_ancestry(path: Path, description: str) -> None:
         current = current.parent
 
 
+def validate_sealed_deployment_directory(path: Path, description: str) -> Path:
+    deployment = validate_real_directory(path)
+    info = deployment.stat()
+    if info.st_uid != 0 or stat.S_IMODE(info.st_mode) & 0o022:
+        raise SweepError(
+            f"{description} must be root-owned and not group/world writable"
+        )
+    require_root_controlled_ancestry(deployment.parent, description)
+    return deployment
+
+
+def read_deployment_sums(deployment: Path, description: str) -> dict[str, str]:
+    sums_path = deployment / "SHA256SUMS"
+    info = sums_path.lstat()
+    if (
+        sums_path.resolve(strict=True) != sums_path
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or stat.S_IMODE(info.st_mode) & 0o7000
+    ):
+        raise SweepError(
+            f"{description} SHA256SUMS must be a singly linked root-owned "
+            "nonwritable file"
+        )
+    sums_text = read_regular_nofollow(sums_path, 64 * 1024).decode("ascii", "strict")
+    sums: dict[str, str] = {}
+    for line in sums_text.splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
+        if match is None or match.group(2) in sums:
+            raise SweepError(f"{description} SHA256SUMS is noncanonical")
+        sums[match.group(2)] = match.group(1)
+    return sums
+
+
+def verify_sealed_deployment_member(
+    path: Path, sums: Mapping[str, str], description: str
+) -> None:
+    info = path.lstat()
+    if (
+        path.resolve(strict=True) != path
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_nlink != 1
+        or stat.S_IMODE(info.st_mode) & 0o022
+        or stat.S_IMODE(info.st_mode) & 0o7000
+    ):
+        raise SweepError(
+            f"{description} must be a singly linked root-owned nonwritable file: "
+            f"{path.name}"
+        )
+    if path.name not in sums or checksum_file(path) != sums[path.name]:
+        raise SweepError(f"{description} checksum mismatch: {path.name}")
+
+
 def verify_deployment(
     deploy: Path,
     manifest: Path,
     cohorts: Sequence[Cohort],
     cohort_bootstraps: Sequence[Path] = (),
 ) -> Path:
-    deploy = validate_real_directory(deploy)
-    if deploy.stat().st_uid != 0 or stat.S_IMODE(deploy.stat().st_mode) & 0o022:
-        raise SweepError("deployment must be root-owned and not group/world writable")
-    require_root_controlled_ancestry(deploy.parent, "deployment")
-    sums_path = deploy / "SHA256SUMS"
-    sums_text = read_regular_nofollow(sums_path, 64 * 1024).decode("ascii", "strict")
-    sums: dict[str, str] = {}
-    for line in sums_text.splitlines():
-        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9._-]+)", line)
-        if match is None or match.group(2) in sums:
-            raise SweepError("deployment SHA256SUMS is noncanonical")
-        sums[match.group(2)] = match.group(1)
+    deploy = validate_sealed_deployment_directory(deploy, "deployment")
+    sums = read_deployment_sums(deploy, "deployment")
     required = {"jetstreamer-node", manifest.name}
     required.update(
         worker_name
@@ -2638,27 +2687,21 @@ def verify_deployment(
         for _, worker_name in runtime_workers(cohort)
     )
     for bootstrap in cohort_bootstraps:
-        if bootstrap.parent != deploy:
-            raise SweepError(
-                "cohort bootstrap must be a direct member of the sealed deployment"
-            )
-        required.add(bootstrap.name)
+        if bootstrap.parent == deploy:
+            required.add(bootstrap.name)
+            continue
+        source_deployment = validate_sealed_deployment_directory(
+            bootstrap.parent, "cohort bootstrap deployment"
+        )
+        source_sums = read_deployment_sums(
+            source_deployment, "cohort bootstrap deployment"
+        )
+        verify_sealed_deployment_member(
+            bootstrap, source_sums, "cohort bootstrap deployment member"
+        )
     for name in sorted(required):
         path = deploy / name
-        info = path.lstat()
-        if (
-            path.resolve(strict=True) != path
-            or not stat.S_ISREG(info.st_mode)
-            or info.st_uid != 0
-            or info.st_nlink != 1
-            or stat.S_IMODE(info.st_mode) & 0o022
-            or stat.S_IMODE(info.st_mode) & 0o7000
-        ):
-            raise SweepError(
-                f"deployment member must be a singly linked root-owned nonwritable file: {name}"
-            )
-        if name not in sums or checksum_file(path) != sums[name]:
-            raise SweepError(f"deployment checksum mismatch for {name}")
+        verify_sealed_deployment_member(path, sums, "deployment member")
     if manifest.parent != deploy:
         raise SweepError("sealed manifest must be a direct deployment member")
     return deploy
