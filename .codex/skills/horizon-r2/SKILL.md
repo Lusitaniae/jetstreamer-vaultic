@@ -61,6 +61,28 @@ state are host-local evidence and must not be copied to make another host believ
 Give concurrently operating hosts disjoint explicit epoch ranges. Existing R2 objects are never a
 lease: if ranges overlap accidentally, stop the duplicate producer rather than racing publication.
 
+### Preserve valid work and yield shared boundary uploads
+
+- Preserve valid or resumable local work by default. Do not discard, restart from scratch,
+  quarantine as disposable, or otherwise retire an archive, replay state, segment manifest, or
+  verification evidence merely because another agent or server is working on the same epoch.
+  Work is legitimately completed elsewhere only after the canonical R2 archive and matching
+  sidecar form a verified `ready-pair`. Even then, remove the local copy only through the normal
+  receipt and boundary-gated retirement path; remote completion does not make useful local evidence
+  disposable.
+- For an epoch at a range or server boundary, an authenticated active upload owned by another agent
+  is a handoff: assume that owner will finish it and do not race it with another upload, sidecar, or
+  replay. Require evidence that binds the exact epoch/object keys to a live uploader invocation or
+  durable active handoff; an archive-only object, an incomplete multipart upload, a stale status
+  message, or an unbound process is not enough. Re-observe the owner at the normal monitoring
+  cadence and treat only the matching canonical sidecar as completion.
+- If the owning upload terminates or its authenticated handle disappears before the ready-pair is
+  committed, inspect its durable state and resume idempotently from preserved valid artifacts.
+  Never delete those artifacts to simplify ownership. If a matching ready-pair appears, yield the
+  boundary epoch to that completed work and continue the disjoint remainder; if any remote anomaly
+  or mismatch appears, stop and investigate instead of choosing a winner or overwriting either
+  copy.
+
 ## Produce and verify
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
