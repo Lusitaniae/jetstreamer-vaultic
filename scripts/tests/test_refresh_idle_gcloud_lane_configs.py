@@ -202,7 +202,7 @@ class IdleGCloudRefreshTests(unittest.TestCase):
             "source_snapshot": f"{workspace}/source.snapshot",
             "account": "account@example.invalid",
             "project": "sealed-project",
-            "gcloud_bin": "/usr/bin/true",
+            "gcloud_bin": str(Path("/usr/bin/true").resolve(strict=True)),
             "probe": {**self.probe(), "md5_hash": None},
             "units": [{
                 "kind": "loaded-unit",
