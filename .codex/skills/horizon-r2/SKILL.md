@@ -9,6 +9,24 @@ Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Abort
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, and reads the completed remote object back while computing its whole-file SHA-256. It must fully upload, complete, read back, and revalidate the `.jet` before it uploads the canonical `.sha256` sidecar. It then reads the sidecar back and fsyncs a private receipt before optional local retirement. Treat presence of the matching sidecar as the remote readiness commit marker; an archive without one is staged, and a sidecar without an archive or whose digest does not match the archive is an error. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
+## Rust-first implementation policy
+
+- Implement all new Horizon production, verification, delivery, orchestration, monitoring,
+  admission, receipt-writing, and operational tooling in Rust by default. Do not add new Python or
+  shell business logic when the behavior can be owned by a reviewed Rust binary. Keep archive
+  parsing, hashing and integrity decisions, publication gates, R2 access, and local retirement in
+  Rust.
+- Existing reviewed and sealed Python or shell components may continue when they are already bound
+  into an active or prepared workflow and replacing them would invalidate durable evidence,
+  require restarting healthy work, or add migration risk. Do not stop, restart, or mutate a healthy
+  producer merely to change implementation language. Replace these components with reviewed Rust
+  implementations at the earliest safe opportunity, but do not let language migration delay,
+  block, or destabilize the active Horizon campaign.
+- When materially extending an existing non-Rust component, prefer replacing that behavior with a
+  tested, immutable Rust tool and migrate only through the normal sealing and capability gates. If
+  an urgent safety repair must remain in the existing language, keep it narrowly scoped, preserve
+  the Rust integrity boundary, and do not treat it as precedent for new non-Rust functionality.
+
 For a long-running range, use `scripts/sync_horizon_r2_progressive.py` to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The Python process never implements remote integrity checks or unlinks files itself. Upload requires digest-matching full-verification and current-plugin receipts. Optional local retirement additionally requires both adjacent-boundary receipts. This separation lets disjoint servers publish complete archives so a retired neighbor can be restored from R2 to close a cross-host boundary without circularly weakening retirement. The orchestrator requires the exact approved binary and verifier-script SHA-256 values, accepts explicit comma-separated binary- and script-hash allowlists during a pinned verifier transition, honors every `--defer-epochs` range for retirement, and then delegates remote verification plus optional local retirement to the Rust uploader.
 
 ## Resolve the work
