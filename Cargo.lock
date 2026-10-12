@@ -4950,6 +4950,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetstreamer-r2-progressive"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "jetstreamer-utils"
 version = "0.8.1"
 dependencies = [

@@ -260,10 +260,12 @@ jetstreamer-r2 retire-local /absolute/horizon/directory \
   --receipt-directory /absolute/private/r2-receipts
 ```
 
-`scripts/sync_horizon_r2_progressive.py` permits R2 publication after the full and current-plugin
-receipts agree with the archive. Local retirement remains stricter and additionally requires both
+`jetstreamer-r2-progressive` permits R2 publication after the full and current-plugin receipts
+agree with the archive. Local retirement remains stricter and additionally requires both
 adjacent-boundary receipts. This allows disjoint producers to exchange a verified boundary neighbor
-through R2 without creating a circular upload dependency.
+through R2 without creating a circular upload dependency. Use the Rust coordinator for new
+deployments. The legacy `scripts/sync_horizon_r2_progressive.py` coordinator is retained only for
+already-sealed workflows whose evidence would be invalidated by an in-place implementation change.
 
 When a user has explicitly authorized local retirement at a filesystem floor,
 `scripts/retire_horizon_at_reserve.py` is the bounded emergency policy wrapper. Configure the
@@ -283,7 +285,7 @@ requires the approved full, plugin, and boundary-verifier binary/script SHA-256 
 predecessor boundary and the trailing successor boundary.
 
 ```bash
-cargo build --release -p jetstreamer-r2
+cargo build --release -p jetstreamer-r2 -p jetstreamer-r2-progressive
 
 # Sync every complete local pair. Omit --delete-local while an active historical
 # controller still uses this directory as its completion ledger.
@@ -311,13 +313,14 @@ historical compatibility pipeline, and invokes this binary after replay and plug
 With no requested range it starts at the lowest supported missing epoch; an explicit range bounds
 generation, verification, delivery, and cleanup.
 
-For an actively generated range, `scripts/sync_horizon_r2_progressive.py` watches for complete
-archive/sidecar pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private
-receipt still describes the local archive before skipping it. Local retirement additionally
+For an actively generated range, `jetstreamer-r2-progressive` watches for complete archive/sidecar
+pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private receipt still
+describes the current local archive identity before skipping it. Local retirement additionally
 requires receipts from the exact approved full verifier/script, plugin binary/script, and boundary
 verifier/script plus both adjacent archive boundaries. Use `--local-mutation-lock` when a reserve
 retirement wrapper is installed so upload and local retirement cannot inspect or mutate the same
-pair concurrently. The watcher never deletes remote data.
+pair concurrently. The coordinator never deletes remote data; all R2 operations and optional local
+retirement remain delegated to `jetstreamer-r2`.
 
 ### TUI dashboard
 

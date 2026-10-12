@@ -5,6 +5,7 @@ members = [
     "jetstreamer-node",
     "jetstreamer-plugin",
     "jetstreamer-r2",
+    "jetstreamer-r2-progressive",
     "jetstreamer-utils",
 ]
 # Historical consensus workers are separate workspaces pinned to their exact
