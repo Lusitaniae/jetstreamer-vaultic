@@ -1072,8 +1072,20 @@ mod tests {
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(arguments[0], "public-verify");
-        assert!(arguments.contains(&"--public-receipt-directory".to_owned()));
+        assert_eq!(
+            arguments,
+            vec![
+                "public-verify".to_owned(),
+                config.horizon_directory.to_string_lossy().into_owned(),
+                "--epochs".to_owned(),
+                "7-7".to_owned(),
+                "--public-receipt-directory".to_owned(),
+                config
+                    .public_receipt_directory
+                    .to_string_lossy()
+                    .into_owned(),
+            ]
+        );
         assert_eq!(command.get_program(), config.uploader.as_os_str());
     }
 
