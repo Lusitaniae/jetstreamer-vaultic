@@ -311,6 +311,61 @@ class ProgressivePluginVerificationTests(unittest.TestCase):
             self.assertEqual(len(invocations), 1, invocations)
             self.assertNotIn("--full", invocations[0])
 
+    def test_full_range_transition_reuses_prior_receipts_and_checks_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archives = root / "archives"
+            archives.mkdir()
+            state = root / "state"
+            receipts = state / "receipts"
+            receipts.mkdir(parents=True)
+            invocation_log = root / "invocations"
+            verifier = root / "verify_archive"
+            verifier.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {invocation_log}\nexit 0\n",
+                encoding="ascii",
+            )
+            verifier.chmod(verifier.stat().st_mode | stat.S_IXUSR)
+
+            verifier_sha = hashlib.sha256(verifier.read_bytes()).hexdigest()
+            prior_script_sha = "a" * 64
+            for epoch in (7, 8):
+                archive = archives / f"epoch-{epoch}.jet"
+                archive.write_bytes(f"archive-{epoch}".encode("ascii"))
+                archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+                (archives / f"epoch-{epoch}.jet.sha256").write_text(
+                    f"{archive_sha}  epoch-{epoch}.jet\n", encoding="ascii"
+                )
+                (receipts / f"epoch-{epoch}.full.ok").write_text(
+                    f"{archive_sha} {verifier_sha} {prior_script_sha}\n",
+                    encoding="ascii",
+                )
+
+            result = subprocess.run(
+                [
+                    str(RANGE_SCRIPT),
+                    str(verifier),
+                    str(archives),
+                    str(state),
+                    "7",
+                    "8",
+                    "2",
+                    "1",
+                    "1",
+                    prior_script_sha,
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            invocations = invocation_log.read_text(encoding="ascii").splitlines()
+            self.assertEqual(len(invocations), 1, invocations)
+            self.assertIn("--chain", invocations[0])
+            self.assertIn("--segment", invocations[0])
+            self.assertNotIn("--full", invocations[0])
+
     def test_boundary_verifier_accepts_explicit_full_script_transition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
