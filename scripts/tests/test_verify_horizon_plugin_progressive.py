@@ -157,6 +157,160 @@ class ProgressivePluginVerificationTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(chain_receipt.stat().st_mode), 0o600)
             self.assertEqual(full_receipt.read_text().split()[0], archive_sha)
 
+    def test_full_range_uses_segment_mode_for_internal_boundaries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archives = root / "archives"
+            archives.mkdir()
+            state = root / "state"
+            invocation_log = root / "invocations"
+            verifier = root / "verify_archive"
+            verifier.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {invocation_log}\nexit 0\n",
+                encoding="ascii",
+            )
+            verifier.chmod(verifier.stat().st_mode | stat.S_IXUSR)
+
+            for epoch in (7, 8):
+                archive = archives / f"epoch-{epoch}.jet"
+                archive.write_bytes(f"archive-{epoch}".encode("ascii"))
+                archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+                (archives / f"epoch-{epoch}.jet.sha256").write_text(
+                    f"{archive_sha}  epoch-{epoch}.jet\n", encoding="ascii"
+                )
+
+            result = subprocess.run(
+                [
+                    str(RANGE_SCRIPT),
+                    str(verifier),
+                    str(archives),
+                    str(state),
+                    "7",
+                    "8",
+                    "2",
+                    "1",
+                    "1",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            invocations = invocation_log.read_text(encoding="ascii").splitlines()
+            chain_invocations = [line for line in invocations if "--chain" in line]
+            self.assertEqual(len(chain_invocations), 1, invocations)
+            self.assertIn("--segment", chain_invocations[0])
+            self.assertIn(str(archives / "epoch-7.jet"), chain_invocations[0])
+            self.assertIn(str(archives / "epoch-8.jet"), chain_invocations[0])
+
+    def test_full_range_singleton_scans_without_claiming_an_internal_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archives = root / "archives"
+            archives.mkdir()
+            state = root / "state"
+            invocation_log = root / "invocations"
+            verifier = root / "verify_archive"
+            verifier.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {invocation_log}\nexit 0\n",
+                encoding="ascii",
+            )
+            verifier.chmod(verifier.stat().st_mode | stat.S_IXUSR)
+
+            archive = archives / "epoch-7.jet"
+            archive.write_bytes(b"archive")
+            archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+            (archives / "epoch-7.jet.sha256").write_text(
+                f"{archive_sha}  epoch-7.jet\n", encoding="ascii"
+            )
+
+            result = subprocess.run(
+                [
+                    str(RANGE_SCRIPT),
+                    str(verifier),
+                    str(archives),
+                    str(state),
+                    "7",
+                    "7",
+                    "1",
+                    "1",
+                    "1",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            invocations = invocation_log.read_text(encoding="ascii").splitlines()
+            self.assertFalse(any("--chain" in line for line in invocations), invocations)
+            self.assertTrue(
+                any(
+                    line.startswith(str(archive))
+                    and "--full" not in line
+                    and "--internal-full" not in line
+                    for line in invocations
+                ),
+                invocations,
+            )
+
+    def test_full_range_accepts_explicit_prior_script_receipt_during_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archives = root / "archives"
+            archives.mkdir()
+            state = root / "state"
+            receipts = state / "receipts"
+            receipts.mkdir(parents=True)
+            invocation_log = root / "invocations"
+            verifier = root / "verify_archive"
+            verifier.write_text(
+                f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {invocation_log}\nexit 0\n",
+                encoding="ascii",
+            )
+            verifier.chmod(verifier.stat().st_mode | stat.S_IXUSR)
+
+            archive = archives / "epoch-7.jet"
+            archive.write_bytes(b"archive")
+            archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+            (archives / "epoch-7.jet.sha256").write_text(
+                f"{archive_sha}  epoch-7.jet\n", encoding="ascii"
+            )
+            verifier_sha = hashlib.sha256(verifier.read_bytes()).hexdigest()
+            prior_script_sha = "a" * 64
+            prior_receipt = f"{archive_sha} {verifier_sha} {prior_script_sha}\n"
+            (receipts / "epoch-7.full.ok").write_text(
+                prior_receipt, encoding="ascii"
+            )
+
+            result = subprocess.run(
+                [
+                    str(RANGE_SCRIPT),
+                    str(verifier),
+                    str(archives),
+                    str(state),
+                    "7",
+                    "7",
+                    "1",
+                    "1",
+                    "1",
+                    prior_script_sha,
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                (receipts / "epoch-7.full.ok").read_text(encoding="ascii"),
+                prior_receipt,
+            )
+            invocations = invocation_log.read_text(encoding="ascii").splitlines()
+            self.assertEqual(len(invocations), 1, invocations)
+            self.assertNotIn("--full", invocations[0])
+
     def test_progressive_verifiers_never_call_syncfs(self) -> None:
         for script in (SCRIPT, WATCHER, BOUNDARY_SCRIPT, RANGE_SCRIPT):
             source = script.read_text(encoding="utf-8")

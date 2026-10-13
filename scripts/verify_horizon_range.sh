@@ -3,7 +3,9 @@
 #
 # Acceptance is the conjunction of three checks:
 #   1. Every archive matches its standard SHA-256 sidecar.
-#   2. One ordered scan verifies coverage, decoding, and all archive boundaries.
+#   2. One ordered scan verifies coverage, decoding, and every boundary inside
+#      the requested range. The outer boundaries are verified separately by
+#      verify_horizon_boundaries_progressive.sh.
 #   3. Each archive independently recomputes every block's PoH in parallel.
 set -Eeuo pipefail
 
@@ -12,11 +14,11 @@ export LC_ALL=C
 export PATH=/usr/bin:/bin
 
 usage() {
-    echo "usage: $0 VERIFY_ARCHIVE ARCHIVE_DIR STATE_DIR START_EPOCH END_EPOCH [JOBS] [THREADS_PER_JOB] [CHAIN_THREADS]" >&2
+    echo "usage: $0 VERIFY_ARCHIVE ARCHIVE_DIR STATE_DIR START_EPOCH END_EPOCH [JOBS] [THREADS_PER_JOB] [CHAIN_THREADS] [ACCEPTED_PRIOR_SCRIPT_SHA256_LIST]" >&2
     exit 2
 }
 
-[[ $# -ge 5 && $# -le 8 ]] || usage
+[[ $# -ge 5 && $# -le 9 ]] || usage
 
 verifier=$1
 archive_dir=$2
@@ -26,6 +28,7 @@ end_epoch=$5
 jobs=${6:-4}
 threads_per_job=${7:-12}
 chain_threads=${8:-8}
+accepted_prior_script_shas=${9:-}
 
 for value in "$start_epoch" "$end_epoch" "$jobs" "$threads_per_job" "$chain_threads"; do
     [[ $value =~ ^[0-9]+$ ]] || usage
@@ -34,6 +37,10 @@ done
 ((jobs >= 1 && jobs <= 64)) || usage
 ((threads_per_job >= 1 && threads_per_job <= 256)) || usage
 ((chain_threads >= 1 && chain_threads <= 256)) || usage
+if [[ -n $accepted_prior_script_shas \
+    && ! $accepted_prior_script_shas =~ ^[0-9a-f]{64}(,[0-9a-f]{64})*$ ]]; then
+    usage
+fi
 [[ $verifier == /* && $archive_dir == /* && $state_dir == /* ]] || usage
 [[ -f $verifier && -x $verifier && ! -L $verifier ]] || {
     echo "verifier must be an executable regular file, not a symlink: $verifier" >&2
@@ -95,6 +102,16 @@ verifier_sha=$(sha256sum -- "$verifier" | awk '{print $1}')
 script_sha=$(sha256sum -- "$0" | awk '{print $1}')
 children=()
 
+script_receipt_is_accepted() {
+    local receipt_script_sha=$1
+    [[ $receipt_script_sha == "$script_sha" ]] && return 0
+    [[ -n $accepted_prior_script_shas ]] || return 1
+    case ",$accepted_prior_script_shas," in
+        *",$receipt_script_sha,"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 cleanup_children() {
     local status=$?
     if ((status != 0 && ${#children[@]} != 0)); then
@@ -150,8 +167,8 @@ run_full_epoch() {
     if [[ -f $receipt ]]; then
         read -r prior_archive prior_verifier prior_script <"$receipt" || true
         if [[ $prior_archive == "$archive_sha" \
-            && $prior_verifier == "$verifier_sha" \
-            && $prior_script == "$script_sha" ]]; then
+            && $prior_verifier == "$verifier_sha" ]] \
+            && script_receipt_is_accepted "$prior_script"; then
             return 0
         fi
     fi
@@ -281,8 +298,20 @@ run_chain() {
         paths+=("$archive_dir/epoch-$epoch.jet")
     done
     local log_tmp="$state_dir/tmp/ordered-chain.$$.tmp"
-    if nice -n 19 ionice -c 3 "$verifier" --chain "${paths[@]}" \
-        --threads "$chain_threads" >"$log_tmp" 2>&1; then
+    local chain_command=("$verifier")
+    if ((start_epoch == end_epoch)); then
+        # A singleton has no internal archive boundary. This independent
+        # non-full scan still proves coverage, decoding, and every stored link;
+        # the two outer boundaries remain the progressive boundary verifier's
+        # responsibility.
+        chain_command+=("${paths[0]}")
+    else
+        # This range is a proper segment of the full chain. Defer only its two
+        # outer boundaries while requiring every boundary inside the range.
+        chain_command+=(--chain "${paths[@]}" --segment)
+    fi
+    chain_command+=(--threads "$chain_threads")
+    if nice -n 19 ionice -c 3 "${chain_command[@]}" >"$log_tmp" 2>&1; then
         mv -f -- "$log_tmp" "$state_dir/logs/ordered-chain.log"
         local receipt_tmp="$state_dir/tmp/ordered-chain-receipt.$$.tmp"
         printf '%s %s %s\n' "$manifest_sha" "$verifier_sha" "$script_sha" >"$receipt_tmp"
