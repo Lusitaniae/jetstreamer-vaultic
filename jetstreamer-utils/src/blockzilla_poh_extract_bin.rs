@@ -503,11 +503,8 @@ fn scan(arguments: &Arguments) -> Result<Output, String> {
             before.nlink()
         ));
     }
-    if before.permissions().mode() & 0o022 != 0 {
-        return Err(format!(
-            "{} is group- or world-writable",
-            arguments.input.display()
-        ));
+    if before.permissions().mode() & 0o222 != 0 {
+        return Err(format!("{} is writable", arguments.input.display()));
     }
 
     let mut reader = HashingReader::new(BufReader::with_capacity(8 * 1024 * 1024, file));
