@@ -203,12 +203,21 @@ def systemctl_show(systemctl: Path, unit: str) -> dict[str, str | int]:
 
 
 def require_producer(sample: dict[str, str | int], expected_invocation: str) -> None:
+    running = (
+        sample["ActiveState"] == "active"
+        and sample["SubState"] == "running"
+    )
+    clean_terminal = (
+        sample["ActiveState"] == "inactive"
+        and sample["SubState"] == "dead"
+        and sample["Result"] == "success"
+        and sample["ExecMainStatus"] == 0
+    )
     if (
         sample["LoadState"] != "loaded"
-        or sample["ActiveState"] != "active"
-        or sample["SubState"] != "running"
         or sample["InvocationID"] != expected_invocation
         or sample["NRestarts"] != 0
+        or not (running or clean_terminal)
     ):
         raise LaunchError(f"producer identity/state mismatch: {sample}")
 

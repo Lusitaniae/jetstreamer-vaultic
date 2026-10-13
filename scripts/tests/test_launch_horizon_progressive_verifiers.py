@@ -187,6 +187,39 @@ class LaunchHorizonProgressiveVerifiersTests(unittest.TestCase):
         self.assertIn("producer identity/state mismatch", result.stderr)
         self.assertFalse(self.intent.exists())
 
+    def test_accepts_clean_terminal_producer(self):
+        state = json.loads(self.state.read_text())
+        state["producer.service"]["ActiveState"] = "inactive"
+        state["producer.service"]["SubState"] = "dead"
+        self.state.write_text(json.dumps(state))
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        producer = json.loads(self.completion.read_text())["producer"]
+        self.assertEqual(producer["Result"], "success")
+        self.assertEqual(producer["ExecMainStatus"], 0)
+
+    def test_rejects_terminal_producer_killed_by_sigterm(self):
+        state = json.loads(self.state.read_text())
+        state["producer.service"]["ActiveState"] = "inactive"
+        state["producer.service"]["SubState"] = "dead"
+        state["producer.service"]["ExecMainStatus"] = "15"
+        self.state.write_text(json.dumps(state))
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("producer identity/state mismatch", result.stderr)
+        self.assertFalse(self.intent.exists())
+
+    def test_rejects_terminal_producer_with_failed_result(self):
+        state = json.loads(self.state.read_text())
+        state["producer.service"]["ActiveState"] = "inactive"
+        state["producer.service"]["SubState"] = "dead"
+        state["producer.service"]["Result"] = "exit-code"
+        self.state.write_text(json.dumps(state))
+        result = self.run_launcher()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("producer identity/state mismatch", result.stderr)
+        self.assertFalse(self.intent.exists())
+
     def test_rejects_noncanonical_sidecar(self):
         self.sidecar.write_text(f"{'1' * 64} epoch-214.jet\n", encoding="ascii")
         result = self.run_launcher()
