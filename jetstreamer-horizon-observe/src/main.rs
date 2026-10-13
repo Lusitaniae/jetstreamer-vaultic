@@ -34,6 +34,7 @@ struct Config {
     schema: String,
     previous_sample: PathBuf,
     minimum_interval_seconds: u64,
+    not_before_utc: String,
     filesystem_path: PathBuf,
     output: PathBuf,
     replays: Vec<ReplayConfig>,
@@ -147,6 +148,7 @@ fn parse_args() -> Result<Config> {
         config.minimum_interval_seconds >= 1800,
         "minimum interval must be at least 1800 seconds"
     );
+    parse_utc(&config.not_before_utc).context("invalid configured not-before timestamp")?;
     ensure!(
         !config.replays.is_empty(),
         "at least one replay is required"
@@ -597,10 +599,15 @@ fn run(config: Config) -> Result<()> {
         "current clock predates previous sample"
     );
     let interval = started_unix - previous_unix;
+    let cadence_not_before = previous_unix
+        .checked_add(config.minimum_interval_seconds)
+        .ok_or_else(|| anyhow!("cadence timestamp overflow"))?;
+    let configured_not_before = parse_utc(&config.not_before_utc)?;
+    let effective_not_before = cadence_not_before.max(configured_not_before);
     ensure!(
-        interval >= config.minimum_interval_seconds,
-        "routine observation interval is only {interval} seconds; require {}",
-        config.minimum_interval_seconds
+        started_unix >= effective_not_before,
+        "observation attempted before {}; previous successful sample interval is {interval} seconds",
+        format_utc(effective_not_before)?
     );
 
     let available_before = filesystem_available_bytes(&config.filesystem_path)?;
@@ -676,6 +683,8 @@ fn run(config: Config) -> Result<()> {
             "previous_sample_sha256": sha256(&previous_bytes),
             "minimum_interval_seconds": config.minimum_interval_seconds,
             "observed_interval_seconds": interval,
+            "configured_not_before_utc": config.not_before_utc,
+            "effective_not_before_utc": format_utc(effective_not_before)?,
             "next_routine_observation_not_before_utc": format_utc(next_observation)?,
         },
         "filesystem": {
