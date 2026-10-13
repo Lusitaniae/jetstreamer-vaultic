@@ -141,24 +141,29 @@ cargo run --release --bin horizon_pipeline -- \
 ```
 
 This checks plugin compatibility and stream delivery. Archive acceptance also requires every
-`.sha256` sidecar and a strict ordered-chain scan. Large ranges can recompute PoH in parallel by
-pairing one non-full chain scan with one internal full scan per archive:
+`.sha256` sidecar, an ordered scan of every boundary inside the selected range, and the separate
+adjacent-edge receipts for its outer boundaries. Large ranges can recompute PoH in parallel by
+pairing one non-full segment scan with one internal full scan per archive:
 
 ```bash
-verify_archive --chain /path/to/horizon/epoch-{0..100}.jet --threads 8
+verify_archive --chain /path/to/horizon/epoch-{214..215}.jet --segment --threads 8
 verify_archive /path/to/horizon/epoch-42.jet \
   --full --internal-full --threads 12
 ```
 
 The internal scan checks every within-archive link and recomputes every block's PoH. It is not an
 acceptance result by itself because it cannot prove the incoming boundary or trailing skipped slots
-without an adjacent archive. The successful chain scan supplies those proofs across every archive
-boundary.
+without an adjacent archive. The successful segment scan proves every boundary inside its range;
+the progressive adjacent-boundary verifier supplies the two outer proofs.
 
 `scripts/verify_horizon_range.sh` starts the independent full scan for each archive as soon as its
 SHA-256 sidecar appears. After the complete range is present, it verifies the range manifest, runs
-the ordered chain scan, and rehashes every archive before recording acceptance. Receipts include
-the archive, verifier, and script hashes, so a restart only repeats stale or unfinished work.
+an ordered `--segment` scan for a multi-archive range (or an independent non-full scan for a
+singleton, which has no internal archive boundary), and rehashes every archive before recording
+acceptance. Receipts include the archive, verifier, and script hashes, so a restart only repeats
+stale or unfinished work. During a pinned script transition, an explicit prior-script SHA-256
+allowlist may preserve already completed per-epoch full receipts; the new ordered-range receipt
+still binds the current script.
 
 Large ranges need not remain on local disk simultaneously. After both adjacent archives have exact
 full-verification receipts, `archive_boundaries --verify-pair` decodes the left archive's terminal
@@ -170,9 +175,9 @@ archive SHA-256 values and the exact boundary verifier. This avoids redundantly 
 gigabytes for every overlapping pair while retaining the same proof: the full receipts cover all
 within-archive structure and PoH, and the edge receipt covers the only cross-archive link. The two
 outer boundaries must still be proved by the neighboring epochs or explicit canonical anchors.
-The full-verifier argument is an explicit comma-separated SHA-256 allowlist so a boundary spanning
-a verifier upgrade can compose two independently approved full receipts without weakening either
-side of the proof.
+The full-verifier and full-verifier-script arguments are explicit comma-separated SHA-256
+allowlists so a boundary spanning a verifier or wrapper upgrade can compose two independently
+approved full receipts without weakening either side of the proof.
 
 `scripts/verify_horizon_plugin_range.sh` is the corresponding progressive launcher for the
 consumer/API gate. It waits for every archive and well-formed sidecar in an inclusive epoch range,
