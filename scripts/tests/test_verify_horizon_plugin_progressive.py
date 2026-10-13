@@ -311,6 +311,54 @@ class ProgressivePluginVerificationTests(unittest.TestCase):
             self.assertEqual(len(invocations), 1, invocations)
             self.assertNotIn("--full", invocations[0])
 
+    def test_boundary_verifier_accepts_explicit_full_script_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archives = root / "archives"
+            archives.mkdir()
+            full_receipts = root / "full-receipts"
+            full_receipts.mkdir()
+            state = root / "state"
+            verifier = root / "archive_boundaries"
+            verifier.write_text("#!/bin/sh\nexit 0\n", encoding="ascii")
+            verifier.chmod(verifier.stat().st_mode | stat.S_IXUSR)
+
+            full_verifier_sha = "b" * 64
+            prior_script_sha = "a" * 64
+            current_script_sha = "c" * 64
+            for epoch in (7, 8):
+                archive = archives / f"epoch-{epoch}.jet"
+                archive.write_bytes(f"archive-{epoch}".encode("ascii"))
+                archive_sha = hashlib.sha256(archive.read_bytes()).hexdigest()
+                (archives / f"epoch-{epoch}.jet.sha256").write_text(
+                    f"{archive_sha}  epoch-{epoch}.jet\n", encoding="ascii"
+                )
+                (full_receipts / f"epoch-{epoch}.full.ok").write_text(
+                    f"{archive_sha} {full_verifier_sha} {prior_script_sha}\n",
+                    encoding="ascii",
+                )
+
+            result = subprocess.run(
+                [
+                    str(BOUNDARY_SCRIPT),
+                    str(verifier),
+                    str(archives),
+                    str(full_receipts),
+                    full_verifier_sha,
+                    f"{current_script_sha},{prior_script_sha}",
+                    str(state),
+                    "7",
+                    "8",
+                    "1",
+                ],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((state / "receipts" / "boundary-7-8.ok").is_file())
+
     def test_progressive_verifiers_never_call_syncfs(self) -> None:
         for script in (SCRIPT, WATCHER, BOUNDARY_SCRIPT, RANGE_SCRIPT):
             source = script.read_text(encoding="utf-8")
