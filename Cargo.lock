@@ -4964,9 +4964,13 @@ dependencies = [
 name = "jetstreamer-utils"
 version = "0.8.1"
 dependencies = [
+ "bs58",
  "ctrlc",
  "libc",
  "log",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "solana-logger",
  "tempfile",
  "tokio",

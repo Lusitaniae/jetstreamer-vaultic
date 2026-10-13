@@ -20,6 +20,10 @@ path = "src/clickhouse_server_bin.rs"
 name = "clickhouse-client"
 path = "src/clickhouse_client_bin.rs"
 
+[[bin]]
+name = "jetstreamer-blockzilla-poh-extract"
+path = "src/blockzilla_poh_extract_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
@@ -27,3 +31,7 @@ tempfile.workspace = true
 libc.workspace = true
 solana-logger.workspace = true
 ctrlc.workspace = true
+bs58 = { workspace = true, features = ["alloc"] }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2.workspace = true

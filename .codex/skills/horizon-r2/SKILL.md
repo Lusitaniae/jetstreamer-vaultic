@@ -665,6 +665,15 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   Revalidate the non-sensitive boundary bytes and collector receipt, then publish them no-clobber into
   a separately fsynced, root-owned immutable bundle with a readable file mode and non-writable directory;
   bind the worker to that deployed path and digest while leaving the original private evidence untouched.
+  When Blockzilla supplies a Compact V2 `poh.wincode`, extract only through the reviewed Rust
+  `jetstreamer-blockzilla-poh-extract` binary. Bind every requested slot and boundary count to the
+  sealed skipped-slot audit, use the runtime's exact ticks-per-slot value, and require the tool to
+  hash the complete singly linked, non-writable input while decoding it. For epoch 208, all 25
+  post-gap slots, 96 total boundaries, and 71 hidden intermediate boundaries are mandatory. Then
+  independently require each extracted final boundary to equal the preserved finalized blockhash
+  and reject any repeated hidden/final hash before deploying the boundary bundle. A decoded file,
+  extractor success, or matching final hashes alone do not authorize runtime-route promotion,
+  canonical sidecars, publication, or R2 upload.
 
 ## Deliver
 

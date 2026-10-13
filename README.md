@@ -698,6 +698,29 @@ Input repair is planned independently of execution and adds five more historical
 | `67,681,336..67,824,000` | exclude pre-v1.5.13 bincode candidates while retaining guarded protobuf fallback; this resolves bytes that are valid but unequal under both v1.5.12 and v1.5.13 | CID-verified contiguous boundary audit: protobuf at the last present predecessor slot 67,681,331, absent slots 67,681,332-335, and five v1.5.13-only records at the first present successor slot 67,681,336; the exact dual-valid slot-67,711,948 fixture is checked in |
 | 73,688 exact records across 88 present slots in `89,856,001..89,856,107` | replace the empty source frame with full finalized-block metadata only after slot, transaction index, signature order, and transaction signature all match | hash-bound full-epoch source audit plus 88 canonicalized finalized `getBlock` captures |
 
+For epoch 208, a Blockzilla Compact V2 `poh.wincode` can provide the ordered hashes that are
+absent from the confirmed-block source. Build `jetstreamer-blockzilla-poh-extract` from the reviewed
+workspace and pass every post-gap slot as `--target SLOT:BOUNDARIES`, where `BOUNDARIES` comes from
+the sealed skipped-slot audit. The extractor opens the input without following symlinks, rejects a
+multiply linked or writable source, decodes and hashes the complete file, requires exactly
+`BOUNDARIES * ticks_per_slot` tick entries per target, and emits every slot-boundary hash in base58
+and hexadecimal form through a durable no-clobber JSON file. For example:
+
+```sh
+cargo run --release -p jetstreamer-utils --bin jetstreamer-blockzilla-poh-extract -- \
+  /absolute/private/epoch-208/poh.wincode \
+  --ticks-per-slot 64 \
+  --target 89856117:2 \
+  --target 89856121:2 \
+  --output /absolute/private/epoch-208-blockzilla-poh-targets.json
+```
+
+The real epoch-208 extraction must include all 25 targets from the audit, not only the two shown
+above. Extractor success is source evidence only: independently compare the exact target set and
+boundary counts with the sealed gap audit, require each final boundary to equal its finalized
+canonical blockhash, and require all 71 hidden boundaries to be distinct before deploying a sealed
+runtime input. The output explicitly grants neither publication nor runtime-route promotion.
+
 Using this narrower definition, which excludes ordinary version pinning, snapshot-format support,
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct
 slot- or record-specific compatibility interventions.
