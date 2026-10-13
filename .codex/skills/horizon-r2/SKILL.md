@@ -38,6 +38,15 @@ Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not
   tested, immutable Rust tool and migrate only through the normal sealing and capability gates. If
   an urgent safety repair must remain in the existing language, keep it narrowly scoped, preserve
   the Rust integrity boundary, and do not treat it as precedent for new non-Rust functionality.
+- Seal every new immutable runtime deployment with the repository's Rust
+  `jetstreamer-seal-deployment` binary, its separately supplied self-SHA-256, and a separately
+  hash-bound JSON plan. The tool must run as root, verify the running executable through
+  `/proc/self/exe`, copy and rehash each declared regular source without following symlinks, fsync every member
+  and the directory, write canonical `SHA256SUMS` plus a no-clobber deployment receipt, and publish
+  the directory with `renameat2(RENAME_NOREPLACE)`. Never hand-assemble a new production package or
+  replace an existing package directory. The seal receipt explicitly denies replay launch,
+  publication, and remote mutation; exact-node capability probes and fresh admission remain
+  independent requirements.
 
 For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust binary to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The coordinator never implements remote integrity checks or unlinks files itself. Upload requires digest-matching full-verification and current-plugin receipts. Optional local retirement additionally requires both adjacent-boundary receipts. This separation lets disjoint servers publish complete archives so a retired neighbor can be restored from R2 to close a cross-host boundary without circularly weakening retirement. The orchestrator requires the exact approved binary and verifier-script SHA-256 values, accepts explicit comma-separated binary- and script-hash allowlists during a pinned verifier transition, honors every `--defer-epochs` range for retirement, and then delegates remote verification plus optional local retirement to the Rust uploader. Retain `scripts/sync_horizon_r2_progressive.py` only for an already-sealed workflow when replacing it in place would invalidate evidence or destabilize active work; do not select it for a new deployment.
 

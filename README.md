@@ -909,6 +909,16 @@ final output is moved to a recoverable backup only after the new archive has pas
 
 ### Adaptive historical sweeps
 
+Create each immutable sweep deployment with `jetstreamer-seal-deployment` rather than copying
+members into a production directory by hand. The command accepts one absolute JSON plan, its
+separately supplied SHA-256, and the separately computed SHA-256 of the running sealer. It verifies
+the latter through `/proc/self/exe`, rehashes every source while copying it into a private stage, fsyncs
+each member, writes canonical `SHA256SUMS` and `deployment-seal-receipt.json`, then publishes the
+root-owned non-writable directory with a no-replace rename. The destination and all of its
+root-controlled ancestry must not be group- or world-writable. The receipt deliberately grants no
+replay, publication, or remote-mutation authority; capability probes and fresh admission remain
+mandatory.
+
 `scripts/adaptive_root_cohort_sweep.py` runs reviewed verification cohorts in separate,
 pre-provisioned lanes. It starts in planning mode. Execution is intended for a detached,
 root-owned service using a root-owned, non-writable deployment tree and owner-only controller
