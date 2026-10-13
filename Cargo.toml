@@ -2,6 +2,7 @@
 members = [
     "jetstreamer-firehose",
     "jetstreamer-horizon",
+    "jetstreamer-horizon-observe",
     "jetstreamer-node",
     "jetstreamer-plugin",
     "jetstreamer-r2",

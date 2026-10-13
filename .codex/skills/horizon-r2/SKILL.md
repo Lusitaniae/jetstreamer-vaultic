@@ -19,6 +19,14 @@ archive and a complete GET for the small sidecar; require the public archive len
 sidecar bytes to agree with the authenticated R2 and local evidence. Public verification must send
 no Authorization, cookie, signed query, or Cloudflare Access credential.
 
+Interpret an explicit request to make or mark all `.jet` archives and sidecars public as authority
+to enable the named bucket's managed `r2.dev` origin or named custom domain once. It is not authority
+to rewrite objects, change metadata, attempt unsupported per-object ACLs, or expose a different
+bucket. After enablement, inventory every storage-complete pair and run anonymous public verification
+for every pair; the bucket-level origin also covers future uploads, which must pass the same public
+gate. If the supplied control-plane credential cannot inspect or enable that origin, preserve all
+objects, report the permission blocker, and leave public delivery incomplete.
+
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, and reads the completed remote object back while computing its whole-file SHA-256. It must fully upload, complete, read back, and revalidate the `.jet` before it uploads the canonical `.sha256` sidecar. It then reads the sidecar back and fsyncs a private receipt before optional local retirement. Treat presence of the matching sidecar as the remote readiness commit marker; an archive without one is staged, and a sidecar without an archive or whose digest does not match the archive is an error. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
 ## Rust-first implementation policy
@@ -412,6 +420,17 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   breakdown for that exact generation. When growth is nonlinear, compare account-store file-size
   distributions and disk/VMA growth per million transactions before attributing it to host capacity
   or launching another worker.
+- Use the repository's Rust `jetstreamer-horizon-observe` binary for a new coordinated live-resource
+  sample instead of adding ad hoc shell or Python sampling logic. Seal the binary and its separately
+  hash-bound JSON configuration before operational use. Bind every replay to the exact controller
+  and producer invocation IDs, zero restarts, exact scratch path, and one worker executable beneath
+  that scratch; require the same identities before and after two race-tolerant, non-symlink-following
+  physical-block scans. Chain the sample to the preceding receipt and enforce at least 1,800 seconds
+  between routine observations. Publish its JSON no-clobber and fsync the file and containing
+  directory. A failed or identity-changing attempt creates no receipt and authorizes no immediate
+  retry inside the cadence window. The sample is resource evidence only: combine it with current
+  invocation-bound guard receipts and the complete reserve/admission arithmetic before launching a
+  new replay or lowering an external remaining-growth claim.
 - For pinned legacy Solana workers, record the visible CPU count and the effective
   `SOLANA_RAYON_THREADS` value. When unset, the old thread-limit crate defaults to half of visible
   CPUs, and AccountsDb also uses that value as its minimum store fan-out; a high-core host can

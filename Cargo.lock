@@ -4844,6 +4844,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jetstreamer-horizon-observe"
+version = "0.8.1"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "jetstreamer-node"
 version = "0.8.1"
 dependencies = [
