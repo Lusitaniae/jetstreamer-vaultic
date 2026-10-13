@@ -184,6 +184,7 @@ def validate(
     total_boundaries = 0
     hidden_boundaries = 0
     previous_slot = -1
+    all_boundary_hashes: set[str] = set()
     for output_slot, receipt_slot in zip(output_slots, receipt_slots):
         if not isinstance(output_slot, dict) or not isinstance(receipt_slot, dict):
             raise DeploymentError("boundary file or receipt contains a non-object slot")
@@ -221,6 +222,9 @@ def validate(
             raise DeploymentError(f"canonical final hash is not attested for slot {slot}")
         if len(set(hashes)) != len(hashes):
             raise DeploymentError(f"boundary hashes repeat within slot {slot}")
+        if all_boundary_hashes.intersection(hashes):
+            raise DeploymentError(f"boundary hashes repeat across slots at slot {slot}")
+        all_boundary_hashes.update(hashes)
         skipped = require_int(receipt_slot, "skipped")
         if skipped != len(hidden) or expected_count != skipped + 1:
             raise DeploymentError(f"gap arithmetic does not match for slot {slot}")

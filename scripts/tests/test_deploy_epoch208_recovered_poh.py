@@ -140,6 +140,23 @@ class RecoveredPohDeploymentTests(unittest.TestCase):
         self.assertIn("does not bind", result.stderr)
         self.assertFalse((self.destination_parent / "bundle").exists())
 
+    def test_rejects_boundary_hash_repeated_across_slots(self) -> None:
+        boundaries = json.loads(self.boundaries.read_text(encoding="utf-8"))
+        receipt = json.loads(self.receipt.read_text(encoding="utf-8"))
+        repeated = boundaries["slots"][0]["boundaries"][0]["hash"]
+        boundaries["slots"][1]["boundaries"][0]["hash"] = repeated
+        receipt["slots"][1]["hidden_boundary_hashes"][0] = repeated
+        boundary_bytes = json.dumps(boundaries, sort_keys=True).encode() + b"\n"
+        self.boundaries.write_bytes(boundary_bytes)
+        receipt["output_sha256"] = hashlib.sha256(boundary_bytes).hexdigest()
+        self.receipt.write_text(
+            json.dumps(receipt, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        result = subprocess.run(self.command(), text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("repeat across slots", result.stderr)
+        self.assertFalse((self.destination_parent / "bundle").exists())
+
     def test_rejects_group_writable_source(self) -> None:
         self.boundaries.chmod(0o620)
         result = subprocess.run(self.command(), text=True, capture_output=True)

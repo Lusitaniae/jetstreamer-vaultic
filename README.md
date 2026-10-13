@@ -716,10 +716,16 @@ cargo run --release -p jetstreamer-utils --bin jetstreamer-blockzilla-poh-extrac
 ```
 
 The real epoch-208 extraction must include all 25 targets from the audit, not only the two shown
-above. Extractor success is source evidence only: independently compare the exact target set and
-boundary counts with the sealed gap audit, require each final boundary to equal its finalized
-canonical blockhash, and require all 71 hidden boundaries to be distinct before deploying a sealed
-runtime input. The output explicitly grants neither publication nor runtime-route promotion.
+above. Extractor success is source evidence only. Pass its sealed output through
+`jetstreamer-blockzilla-boundary-collect` with the exact skipped-slot audit and finalized block
+metadata SHA-256 values. The collector hard-codes the 25 canonical post-gap slots, requires the 96
+per-slot boundaries and 71 hidden boundaries, checks canonical parent-slot arithmetic, requires
+each final boundary and final entry hash to equal its finalized blockhash, and rejects a repeated
+hash anywhere among all 96 hidden or final boundaries. It durably emits the existing
+`jetstreamer-epoch208-decoded-gap-boundaries-v1` worker input plus a private no-clobber receipt.
+Both outputs explicitly deny publication, runtime-route promotion, remote mutation, and R2
+mutation; collector success remains evidence for a later checkpoint qualification, not promotion
+authority by itself.
 
 Using this narrower definition, which excludes ordinary version pinning, snapshot-format support,
 PoH optimization, and AccountsDB maintenance, epochs 0-100 currently require eight distinct

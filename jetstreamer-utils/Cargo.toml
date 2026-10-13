@@ -24,6 +24,10 @@ path = "src/clickhouse_client_bin.rs"
 name = "jetstreamer-blockzilla-poh-extract"
 path = "src/blockzilla_poh_extract_bin.rs"
 
+[[bin]]
+name = "jetstreamer-blockzilla-boundary-collect"
+path = "src/blockzilla_boundary_collect_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true

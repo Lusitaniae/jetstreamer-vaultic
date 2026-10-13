@@ -669,11 +669,16 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   `jetstreamer-blockzilla-poh-extract` binary. Bind every requested slot and boundary count to the
   sealed skipped-slot audit, use the runtime's exact ticks-per-slot value, and require the tool to
   hash the complete singly linked, non-writable input while decoding it. For epoch 208, all 25
-  post-gap slots, 96 total boundaries, and 71 hidden intermediate boundaries are mandatory. Then
-  independently require each extracted final boundary to equal the preserved finalized blockhash
-  and reject any repeated hidden/final hash before deploying the boundary bundle. A decoded file,
-  extractor success, or matching final hashes alone do not authorize runtime-route promotion,
-  canonical sidecars, publication, or R2 upload.
+  post-gap slots, 96 total boundaries, and 71 hidden intermediate boundaries are mandatory. Pass
+  the sealed extractor JSON, skipped-slot audit, and finalized block metadata through the reviewed
+  Rust `jetstreamer-blockzilla-boundary-collect` binary before deployment. The collector must bind
+  all three exact input SHA-256 values, require the fixed 25-slot epoch-208 census and canonical
+  parent arithmetic, require every extracted final boundary and final entry hash to equal the
+  preserved finalized blockhash, and reject a repeated hash anywhere among the 96 hidden or final
+  boundaries. Its no-clobber output and receipt remain private and explicitly deny publication,
+  runtime-route promotion, remote mutation, and R2 mutation. A decoded file, extractor or collector
+  success, or matching final hashes alone do not authorize runtime-route promotion, canonical
+  sidecars, publication, or R2 upload.
 
 ## Deliver
 
