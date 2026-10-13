@@ -5022,8 +5022,10 @@ fn usage(program: &str) -> String {
         "Usage: {program} <epoch|range> [dest-dir] [--verify|--no-verify] [--horizon-output=PATH]\n\
          \x20      [--qualification-end-slot=SLOT] [--root-checkpoint-cohort]\n\
          \x20      [--cohort-manifest=PATH --cohort-manifest-fingerprint=sha256:HEX]\n\
-         \x20      [--recover-staged-only | --recover-staged-cohort-only]\n\
-         \x20      [--source-cohort-receipt=PATH] [--publish-through-epoch=N]\n\
+         \x20      [--recover-staged-only | --recover-staged-cohort-only |\n\
+         \x20       --recover-unreceipted-root-cohort-only]\n\
+         \x20      [--source-cohort-receipt=PATH | --unreceipted-recovery-evidence=PATH]\n\
+         \x20      [--publish-through-epoch=N]\n\
          \n\
          <epoch|range> is a single epoch (950) or an inclusive range (950-955).\n\
          Replays each epoch and writes a horizon archive to <dest-dir>/epoch-<N>.jet.\n\
@@ -5076,7 +5078,15 @@ fn usage(program: &str) -> String {
          only if all public destination names are absent. An explicit\n\
          --publish-through-epoch may retain a verified suffix as private boundary\n\
          evidence while transactionally publishing only the contiguous prefix.\n\
-         It never replays or accesses snapshot storage or the network."
+         It never replays or accesses snapshot storage or the network.\n\
+         --recover-unreceipted-root-cohort-only is the narrower post-terminal\n\
+         recovery route for a cohort whose parent was interrupted after every\n\
+         checkpoint and archive completed but before its source receipt was\n\
+         committed. It requires immutable incident evidence, rebinds the exact\n\
+         producer invocation and zero-worker guard trip, rereads every archive,\n\
+         reconstructs the root gate from exact journal messages, and uses the\n\
+         same transactional publisher. It never starts replay or uses a\n\
+         caller-supplied checkpoint without matching it to the sealed manifest."
     )
 }
 
@@ -5449,13 +5459,12 @@ fn validate_staged_cohort_recovery_mode(
     has_manifest_fingerprint: bool,
     has_source_receipt: bool,
     publish_through_epoch: Option<u64>,
+    publish_through_used_by_unreceipted_recovery: bool,
     has_conflicting_override: bool,
 ) -> Result<(), String> {
     if !enabled {
-        if publish_through_epoch.is_some() {
-            return Err(
-                "--publish-through-epoch requires --recover-staged-cohort-only".to_string(),
-            );
+        if publish_through_epoch.is_some() && !publish_through_used_by_unreceipted_recovery {
+            return Err("--publish-through-epoch requires a cohort recovery mode".to_string());
         }
         return Ok(());
     }
@@ -5498,6 +5507,70 @@ fn validate_staged_cohort_recovery_mode(
     if has_conflicting_override {
         return Err(
             "--recover-staged-cohort-only cannot be combined with replay, output, qualification, or internal child overrides"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_unreceipted_cohort_recovery_mode(
+    enabled: bool,
+    start_epoch: u64,
+    end_epoch: u64,
+    explicit_verify: Option<bool>,
+    verify_option_count: usize,
+    inherited_epoch_lease: bool,
+    has_manifest: bool,
+    has_manifest_fingerprint: bool,
+    has_recovery_evidence: bool,
+    publish_through_epoch: Option<u64>,
+    has_conflicting_override: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    if start_epoch == 0 || start_epoch > end_epoch {
+        return Err(
+            "--recover-unreceipted-root-cohort-only requires a nonempty range of nonzero epochs"
+                .to_string(),
+        );
+    }
+    let cohort_len = end_epoch
+        .checked_sub(start_epoch)
+        .and_then(|difference| difference.checked_add(1))
+        .ok_or_else(|| "unreceipted recovery epoch count overflow".to_string())?;
+    if cohort_len > MAX_ROOT_CHECKPOINT_COHORT_EPOCHS {
+        return Err(format!(
+            "unreceipted recovery range contains {cohort_len} epochs, exceeding the limit of {MAX_ROOT_CHECKPOINT_COHORT_EPOCHS}"
+        ));
+    }
+    if publish_through_epoch.is_some_and(|epoch| epoch < start_epoch || epoch > end_epoch) {
+        return Err(format!(
+            "--publish-through-epoch must be within the recovered cohort {start_epoch}-{end_epoch}"
+        ));
+    }
+    if explicit_verify != Some(true) || verify_option_count != 1 {
+        return Err(
+            "--recover-unreceipted-root-cohort-only requires exactly one explicit --verify"
+                .to_string(),
+        );
+    }
+    if inherited_epoch_lease {
+        return Err(
+            "--recover-unreceipted-root-cohort-only is valid only in a top-level invocation"
+                .to_string(),
+        );
+    }
+    if !has_manifest || !has_manifest_fingerprint || !has_recovery_evidence {
+        return Err(
+            "--recover-unreceipted-root-cohort-only requires --cohort-manifest, --cohort-manifest-fingerprint, and --unreceipted-recovery-evidence"
+                .to_string(),
+        );
+    }
+    if has_conflicting_override {
+        return Err(
+            "--recover-unreceipted-root-cohort-only cannot be combined with another recovery, replay, output, qualification, or internal child override"
                 .to_string(),
         );
     }
@@ -9568,6 +9641,1200 @@ fn verified_cohort_publication_prefix(
     let mut publication_gate = full_gate.clone();
     publication_gate.members.truncate(publication_epochs.len());
     Ok((publication_epochs, publication_gate))
+}
+
+const UNRECEIPTED_COHORT_RECOVERY_SCHEMA: &str =
+    "jetstreamer-unreceipted-root-cohort-recovery-evidence-v1";
+const UNRECEIPTED_COHORT_RECOVERY_RECEIPT_SCHEMA: &str =
+    "jetstreamer-unreceipted-root-cohort-recovery-receipt-v1";
+const MAX_UNRECEIPTED_RECOVERY_EVIDENCE_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_UNRECEIPTED_RECOVERY_JOURNAL_BYTES: usize = 512 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreceiptedRecoveryProducerEvidence {
+    unit: String,
+    invocation_id: String,
+    node_path: PathBuf,
+    node_sha256: String,
+    expected_exec_start: String,
+    expected_exec_main_code: i32,
+    expected_exec_main_status: i32,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreceiptedRecoveryGuardEvidence {
+    receipt_path: PathBuf,
+    receipt_sha256: String,
+    expected_guard_unit: String,
+    expected_guard_invocation_id: String,
+    expected_guard_timer: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreceiptedCheckpointSummary {
+    slot: Slot,
+    bank_hash: String,
+    accounts_hash: String,
+    last_blockhash: String,
+    capitalization: u64,
+    transaction_count: u64,
+    tick_height: u64,
+    slot_complete: bool,
+    write_count: u64,
+    next_write_version: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreceiptedCheckpointEvidence {
+    kind: String,
+    epoch: Option<u64>,
+    journal_message: String,
+    summary: UnreceiptedCheckpointSummary,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreceiptedArchiveCompletionEvidence {
+    epoch: u64,
+    archive_size: u64,
+    journal_message: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnreceiptedCohortRecoveryEvidence {
+    schema: String,
+    recorded_at_utc: String,
+    start_epoch: u64,
+    end_epoch: u64,
+    manifest_fingerprint: String,
+    source_run: PathBuf,
+    source_state_sha256: String,
+    producer: UnreceiptedRecoveryProducerEvidence,
+    guard: UnreceiptedRecoveryGuardEvidence,
+    checkpoints: Vec<UnreceiptedCheckpointEvidence>,
+    archive_completions: Vec<UnreceiptedArchiveCompletionEvidence>,
+    required_journal_messages: Vec<String>,
+    recovery_receipt: PathBuf,
+    remote_mutations: bool,
+    r2_mutations: bool,
+}
+
+fn parse_lower_sha256(value: &str, context: &str) -> Result<[u8; 32], String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{context} must contain 64 lowercase hexadecimal digits"
+        ));
+    }
+    let mut digest = [0u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        let offset = index * 2;
+        *byte = u8::from_str_radix(&value[offset..offset + 2], 16)
+            .map_err(|error| format!("invalid {context}: {error}"))?;
+    }
+    Ok(digest)
+}
+
+fn read_bound_recovery_file(
+    path: &Path,
+    maximum_bytes: u64,
+    allow_root_owner: bool,
+) -> Result<(Vec<u8>, [u8; 32]), String> {
+    use std::{
+        io::Read as _,
+        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+    };
+
+    if !path.is_absolute() {
+        return Err(format!(
+            "recovery evidence path must be absolute: {}",
+            path.display()
+        ));
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize {}: {error}", path.display()))?;
+    if canonical != path {
+        return Err(format!(
+            "recovery evidence path must be canonical: {}",
+            path.display()
+        ));
+    }
+    let before = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {}: {error}", path.display()))?;
+    let owner_is_trusted =
+        before.uid() == effective_user_id() || (allow_root_owner && before.uid() == 0);
+    if !before.file_type().is_file()
+        || before.nlink() != 1
+        || !owner_is_trusted
+        || before.permissions().mode() & 0o022 != 0
+        || before.len() > maximum_bytes
+    {
+        return Err(format!(
+            "recovery evidence file has an unsafe identity: {}",
+            path.display()
+        ));
+    }
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("failed to inspect open {}: {error}", path.display()))?;
+    if opened.dev() != before.dev()
+        || opened.ino() != before.ino()
+        || opened.len() != before.len()
+        || opened.mtime() != before.mtime()
+        || opened.mtime_nsec() != before.mtime_nsec()
+    {
+        return Err(format!(
+            "recovery evidence changed while it was opened: {}",
+            path.display()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let after = file
+        .metadata()
+        .map_err(|error| format!("failed to recheck open {}: {error}", path.display()))?;
+    let current = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to recheck {}: {error}", path.display()))?;
+    for observed in [&opened, &after, &current] {
+        if observed.dev() != before.dev()
+            || observed.ino() != before.ino()
+            || observed.len() != before.len()
+            || observed.mtime() != before.mtime()
+            || observed.mtime_nsec() != before.mtime_nsec()
+            || observed.uid() != before.uid()
+            || observed.gid() != before.gid()
+            || observed.nlink() != before.nlink()
+            || observed.permissions().mode() != before.permissions().mode()
+        {
+            return Err(format!(
+                "recovery evidence changed while it was read: {}",
+                path.display()
+            ));
+        }
+    }
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    Ok((bytes, digest))
+}
+
+fn hash_bound_recovery_file(path: &Path) -> Result<[u8; 32], String> {
+    let file = jetstreamer_node::archive_checksum::open_regular_nofollow(path)
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+    jetstreamer_node::archive_checksum::measure_open_archive(&file)
+        .map(|measured| measured.sha256)
+        .map_err(|error| format!("failed to hash {}: {error}", path.display()))
+}
+
+fn recovery_checkpoint_summary(
+    summary: &UnreceiptedCheckpointSummary,
+) -> Result<cohort_publication::RootCheckpointSummary, String> {
+    let bank_hash = summary
+        .bank_hash
+        .parse::<Hash>()
+        .map_err(|error| format!("invalid recovery bank hash: {error}"))?;
+    let accounts_hash = summary
+        .accounts_hash
+        .parse::<Hash>()
+        .map_err(|error| format!("invalid recovery accounts hash: {error}"))?;
+    let last_blockhash = summary
+        .last_blockhash
+        .parse::<Hash>()
+        .map_err(|error| format!("invalid recovery last blockhash: {error}"))?;
+    Ok(cohort_publication::RootCheckpointSummary {
+        slot: summary.slot,
+        bank_hash: bank_hash.to_bytes(),
+        accounts_hash: accounts_hash.to_bytes(),
+        last_blockhash: last_blockhash.to_bytes(),
+        capitalization: summary.capitalization,
+        transaction_count: summary.transaction_count,
+        tick_height: summary.tick_height,
+        slot_complete: summary.slot_complete,
+        write_count: summary.write_count,
+        next_write_version: summary.next_write_version,
+    })
+}
+
+fn validate_checkpoint_journal_binding(
+    checkpoint: &UnreceiptedCheckpointEvidence,
+) -> Result<(), String> {
+    let summary = &checkpoint.summary;
+    let expected_suffix = format!(
+        "historical checkpoint slot={} bank_hash={} accounts_hash={} last_blockhash={} capitalization={} transactions={} tick_height={} complete={} writes={} next_write_version={}",
+        summary.slot,
+        summary.bank_hash,
+        summary.accounts_hash,
+        summary.last_blockhash,
+        summary.capitalization,
+        summary.transaction_count,
+        summary.tick_height,
+        summary.slot_complete,
+        summary.write_count,
+        summary.next_write_version,
+    );
+    if !checkpoint
+        .journal_message
+        .contains("jetstreamer_node::historical_replay]")
+        || !checkpoint.journal_message.ends_with(&expected_suffix)
+    {
+        return Err(format!(
+            "recovery checkpoint summary is not mechanically bound to its journal line at slot {}",
+            summary.slot
+        ));
+    }
+    Ok(())
+}
+
+fn validate_archive_completion_journal_binding(
+    completion: &UnreceiptedArchiveCompletionEvidence,
+) -> Result<(), String> {
+    if !completion
+        .journal_message
+        .contains("jetstreamer_node::horizon] horizon archive complete:")
+    {
+        return Err(format!(
+            "epoch {} archive completion is not a Horizon archive-complete journal line",
+            completion.epoch
+        ));
+    }
+    let byte_values = completion
+        .journal_message
+        .split_ascii_whitespace()
+        .filter_map(|field| field.strip_prefix("bytes="))
+        .map(|value| value.parse::<u64>())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "epoch {} archive completion has an invalid byte count: {error}",
+                completion.epoch
+            )
+        })?;
+    if byte_values != [completion.archive_size] {
+        return Err(format!(
+            "epoch {} archive completion size is not mechanically bound to its journal line",
+            completion.epoch
+        ));
+    }
+    Ok(())
+}
+
+fn systemd_recovery_fields(
+    unit: &str,
+    required_prefix: &str,
+) -> Result<BTreeMap<String, String>, String> {
+    if !unit.starts_with(required_prefix)
+        || !unit.ends_with(".service")
+        || !unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"@_.-".contains(&byte))
+    {
+        return Err("recovery producer unit name is invalid".to_string());
+    }
+    let output = std::process::Command::new("/usr/bin/systemctl")
+        .args([
+            "show",
+            unit,
+            "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,ExecMainCode,ExecMainStatus,ExecStart",
+            "--no-pager",
+        ])
+        .output()
+        .map_err(|error| format!("failed to inspect recovery producer unit: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to inspect recovery producer unit: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|error| format!("systemd recovery state is not UTF-8: {error}"))?;
+    Ok(text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect())
+}
+
+fn exact_invocation_journal(invocation_id: &str) -> Result<String, String> {
+    if invocation_id.len() != 32
+        || !invocation_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("recovery producer invocation ID is invalid".to_string());
+    }
+    let selector = format!("_SYSTEMD_INVOCATION_ID={invocation_id}");
+    let output = std::process::Command::new("/usr/bin/journalctl")
+        .args([selector.as_str(), "--no-pager", "-o", "cat"])
+        .output()
+        .map_err(|error| format!("failed to read exact producer journal: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "failed to read exact producer journal: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if output.stdout.len() > MAX_UNRECEIPTED_RECOVERY_JOURNAL_BYTES {
+        return Err("exact producer journal exceeds the recovery bound".to_string());
+    }
+    String::from_utf8(output.stdout)
+        .map_err(|error| format!("exact producer journal is not UTF-8: {error}"))
+}
+
+fn validate_guard_trip_value(
+    evidence: &UnreceiptedCohortRecoveryEvidence,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let expected_reason = format!(
+        "{} has 0 identifiable historical workers",
+        evidence.producer.unit
+    );
+    let sample = value
+        .get("samples")
+        .and_then(serde_json::Value::as_array)
+        .filter(|samples| samples.len() == 1)
+        .and_then(|samples| samples.first())
+        .ok_or_else(|| "recovery guard receipt lacks exactly one sample".to_string())?;
+    let expected_invocation = value
+        .get("expected_invocations")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|bindings| bindings.get(&evidence.producer.unit))
+        .and_then(serde_json::Value::as_str);
+    if value.get("schema").and_then(serde_json::Value::as_str)
+        != Some("jetstreamer-historical-performance-guard-trip-v1")
+        || value.get("timer_unit").and_then(serde_json::Value::as_str)
+            != Some(evidence.guard.expected_guard_timer.as_str())
+        || expected_invocation != Some(evidence.producer.invocation_id.as_str())
+        || value.get("trip_reasons") != Some(&serde_json::json!([expected_reason]))
+        || sample.get("unit").and_then(serde_json::Value::as_str)
+            != Some(evidence.producer.unit.as_str())
+        || sample
+            .get("invocation_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(evidence.producer.invocation_id.as_str())
+        || sample
+            .get("active_state")
+            .and_then(serde_json::Value::as_str)
+            != Some("active")
+        || sample.get("sub_state").and_then(serde_json::Value::as_str) != Some("running")
+        || sample.get("restarts").and_then(serde_json::Value::as_u64) != Some(0)
+        || sample
+            .get("worker_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+        || sample.get("worker_pid") != Some(&serde_json::Value::Null)
+        || sample.get("worker_vmas") != Some(&serde_json::Value::Null)
+    {
+        return Err(
+            "guard receipt does not prove the exact zero-worker terminal handoff".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_guard_trip_receipt(
+    evidence: &UnreceiptedCohortRecoveryEvidence,
+) -> Result<([u8; 32], [u8; 32]), String> {
+    let (bytes, digest) = read_bound_recovery_file(
+        &evidence.guard.receipt_path,
+        MAX_UNRECEIPTED_RECOVERY_EVIDENCE_BYTES,
+        true,
+    )?;
+    if digest
+        != parse_lower_sha256(
+            &evidence.guard.receipt_sha256,
+            "recovery guard receipt SHA-256",
+        )?
+    {
+        return Err("recovery guard receipt digest mismatch".to_string());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid recovery guard receipt: {error}"))?;
+    validate_guard_trip_value(evidence, &value)?;
+    let guard_fields =
+        systemd_recovery_fields(&evidence.guard.expected_guard_unit, "horizon-monitor-")?;
+    let expected_guard_fields = [
+        ("LoadState", "loaded".to_string()),
+        ("ActiveState", "failed".to_string()),
+        ("SubState", "failed".to_string()),
+        ("Result", "exit-code".to_string()),
+        ("MainPID", "0".to_string()),
+        (
+            "InvocationID",
+            evidence.guard.expected_guard_invocation_id.clone(),
+        ),
+        ("NRestarts", "0".to_string()),
+        ("ExecMainCode", "1".to_string()),
+        ("ExecMainStatus", "1".to_string()),
+    ];
+    if expected_guard_fields
+        .iter()
+        .any(|(name, expected)| guard_fields.get(*name) != Some(expected))
+    {
+        return Err(format!(
+            "guard unit does not remain at the bound terminal trip state: {guard_fields:?}"
+        ));
+    }
+    let guard_journal = exact_invocation_journal(&evidence.guard.expected_guard_invocation_id)?;
+    let guard_journal_sha256: [u8; 32] = Sha256::digest(guard_journal.as_bytes()).into();
+    let guard_values = guard_journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect::<Vec<_>>();
+    if guard_values
+        .iter()
+        .filter(|candidate| **candidate == value)
+        .count()
+        != 1
+    {
+        return Err(
+            "guard invocation journal does not contain exactly one copy of the bound trip receipt"
+                .to_string(),
+        );
+    }
+    let stop_records = guard_values
+        .iter()
+        .filter(|candidate| candidate.get("stop_outcomes").is_some())
+        .collect::<Vec<_>>();
+    let stop_record = stop_records
+        .first()
+        .filter(|_| stop_records.len() == 1)
+        .ok_or_else(|| {
+            "guard invocation journal lacks exactly one producer/timer stop outcome".to_string()
+        })?;
+    let expected_stop_units = serde_json::json!([evidence.producer.unit]);
+    let expected_timer = evidence.guard.expected_guard_timer.as_str();
+    let stop_outcomes = stop_record
+        .get("stop_outcomes")
+        .and_then(serde_json::Value::as_array)
+        .filter(|outcomes| outcomes.len() == 1)
+        .and_then(|outcomes| outcomes.first())
+        .ok_or_else(|| "guard stop outcome is malformed".to_string())?;
+    if stop_outcomes
+        .get("return_code")
+        .and_then(serde_json::Value::as_i64)
+        != Some(0)
+        || stop_outcomes.get("units") != Some(&expected_stop_units)
+        || stop_record
+            .pointer("/timer_stop/return_code")
+            .and_then(serde_json::Value::as_i64)
+            != Some(0)
+        || stop_record
+            .pointer("/timer_stop/unit")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_timer)
+    {
+        return Err("guard invocation journal does not prove the bound clean stop".to_string());
+    }
+    Ok((digest, guard_journal_sha256))
+}
+
+fn build_unreceipted_recovery_gate(
+    evidence: &UnreceiptedCohortRecoveryEvidence,
+    plan: &RootCheckpointCohortPlan,
+    journal: &str,
+) -> Result<cohort_publication::RootCheckpointGateEvidence, String> {
+    let journal_lines = journal.lines().collect::<Vec<_>>();
+    let require_exact_line = |line: &str| -> Result<(), String> {
+        let count = journal_lines
+            .iter()
+            .filter(|candidate| **candidate == line)
+            .count();
+        if count != 1 {
+            return Err(format!(
+                "recovery journal line occurs {count} times instead of once: {line}"
+            ));
+        }
+        Ok(())
+    };
+    if evidence.required_journal_messages.is_empty()
+        || evidence
+            .required_journal_messages
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != evidence.required_journal_messages.len()
+    {
+        return Err(
+            "recovery evidence must contain a nonempty set of unique required journal messages"
+                .to_string(),
+        );
+    }
+    for line in &evidence.required_journal_messages {
+        require_exact_line(line)?;
+    }
+    for checkpoint in &evidence.checkpoints {
+        validate_checkpoint_journal_binding(checkpoint)?;
+        require_exact_line(&checkpoint.journal_message)?;
+    }
+    for completion in &evidence.archive_completions {
+        validate_archive_completion_journal_binding(completion)?;
+        require_exact_line(&completion.journal_message)?;
+    }
+    let expected_epoch_count = usize::try_from(
+        evidence
+            .end_epoch
+            .checked_sub(evidence.start_epoch)
+            .and_then(|difference| difference.checked_add(1))
+            .ok_or_else(|| "recovery evidence epoch count overflow".to_string())?,
+    )
+    .map_err(|_| "recovery evidence epoch count does not fit memory".to_string())?;
+    let expected_checkpoint_count = expected_epoch_count
+        .checked_add(plan.root_checkpoints.len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| "recovery checkpoint count overflow".to_string())?;
+    if evidence.checkpoints.len() != expected_checkpoint_count
+        || evidence.checkpoints.iter().any(|checkpoint| {
+            !matches!(
+                checkpoint.kind.as_str(),
+                "bootstrap" | "manifest" | "terminal"
+            )
+        })
+    {
+        return Err("recovery evidence has an invalid checkpoint inventory".to_string());
+    }
+    let expected_completion_epochs =
+        (evidence.start_epoch..=evidence.end_epoch).collect::<HashSet<_>>();
+    let actual_completion_epochs = evidence
+        .archive_completions
+        .iter()
+        .map(|completion| completion.epoch)
+        .collect::<HashSet<_>>();
+    if evidence.archive_completions.len() != expected_epoch_count
+        || actual_completion_epochs != expected_completion_epochs
+    {
+        return Err("recovery evidence has an invalid archive-completion inventory".to_string());
+    }
+    let require_fragment_count = |fragment: &str, expected: usize| -> Result<(), String> {
+        let observed = journal_lines
+            .iter()
+            .filter(|line| line.contains(fragment))
+            .count();
+        if observed != expected {
+            return Err(format!(
+                "recovery journal fragment occurs {observed} times instead of {expected}: {fragment}"
+            ));
+        }
+        Ok(())
+    };
+    require_fragment_count(
+        &format!(
+            "root-checkpoint cohort {}-{} bound sealed preflight {}",
+            evidence.start_epoch, evidence.end_epoch, evidence.manifest_fingerprint
+        ),
+        1,
+    )?;
+    require_fragment_count(
+        &format!(
+            "root-checkpoint cohort verification bound its bootstrap and {} root checkpoint(s) through epoch {}",
+            plan.root_checkpoints.len(),
+            evidence.end_epoch
+        ),
+        1,
+    )?;
+    require_fragment_count("firehose finished successfully.", expected_epoch_count)?;
+    require_fragment_count("snapshot verification complete", 1)?;
+    for epoch in evidence.start_epoch..evidence.end_epoch {
+        require_fragment_count(
+            &format!(
+                "root-checkpoint cohort retained validated epoch {epoch} privately; publication remains closed"
+            ),
+            1,
+        )?;
+    }
+    let fatal_needles = [
+        "panic",
+        "fatal",
+        "segmentation",
+        "killed process",
+        "out of memory",
+        "divergence",
+        "hash mismatch",
+    ];
+    if let Some(line) = journal_lines.iter().find(|line| {
+        let lower = line.to_ascii_lowercase();
+        fatal_needles.iter().any(|needle| lower.contains(needle))
+    }) {
+        return Err(format!(
+            "exact producer journal contains a fatal recovery marker: {line}"
+        ));
+    }
+    if journal_lines
+        .iter()
+        .any(|line| line.contains("opening publication gate"))
+    {
+        return Err(
+            "producer journal says the original publication gate opened; use batch recovery"
+                .to_string(),
+        );
+    }
+
+    let bootstrap = evidence
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.kind == "bootstrap")
+        .collect::<Vec<_>>();
+    if bootstrap.len() != 1 || bootstrap[0].epoch != Some(evidence.start_epoch) {
+        return Err("recovery evidence must contain one first-epoch bootstrap".to_string());
+    }
+    let bootstrap_summary = recovery_checkpoint_summary(&bootstrap[0].summary)?;
+    let expected_bootstrap_hash = plan
+        .bootstrap
+        .accounts_hash
+        .parse::<Hash>()
+        .map_err(|error| format!("invalid manifest bootstrap hash: {error}"))?;
+    if bootstrap_summary.slot != plan.bootstrap.slot
+        || bootstrap_summary.accounts_hash != expected_bootstrap_hash.to_bytes()
+        || !bootstrap_summary.slot_complete
+    {
+        return Err("recovery bootstrap does not bind the sealed manifest".to_string());
+    }
+
+    let manifest_checkpoints = evidence
+        .checkpoints
+        .iter()
+        .filter(|checkpoint| checkpoint.kind == "manifest")
+        .collect::<Vec<_>>();
+    if manifest_checkpoints.len() != plan.root_checkpoints.len() {
+        return Err("recovery evidence has the wrong manifest checkpoint count".to_string());
+    }
+    for expected in &plan.root_checkpoints {
+        let matches = manifest_checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.summary.slot == expected.slot)
+            .collect::<Vec<_>>();
+        let expected_hash = expected
+            .accounts_hash
+            .parse::<Hash>()
+            .map_err(|error| format!("invalid manifest checkpoint hash: {error}"))?;
+        if matches.len() != 1
+            || matches[0].epoch.is_some()
+            || !matches[0].summary.slot_complete
+            || matches[0]
+                .summary
+                .accounts_hash
+                .parse::<Hash>()
+                .map_err(|error| format!("invalid recovery checkpoint hash: {error}"))?
+                != expected_hash
+        {
+            return Err(format!(
+                "recovery evidence does not bind manifest checkpoint {}",
+                expected.slot
+            ));
+        }
+    }
+
+    let mut members = Vec::new();
+    let mut carried = bootstrap_summary;
+    for epoch in evidence.start_epoch..=evidence.end_epoch {
+        let terminals = evidence
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.kind == "terminal" && checkpoint.epoch == Some(epoch))
+            .collect::<Vec<_>>();
+        if terminals.len() != 1 {
+            return Err(format!(
+                "recovery evidence must contain one terminal checkpoint for epoch {epoch}"
+            ));
+        }
+        let terminal = recovery_checkpoint_summary(&terminals[0].summary)?;
+        let (epoch_start, epoch_end) = epoch_to_slot_range(epoch);
+        if !(epoch_start..=epoch_end).contains(&terminal.slot) || !terminal.slot_complete {
+            return Err(format!(
+                "recovery terminal checkpoint for epoch {epoch} is incomplete or out of range"
+            ));
+        }
+        members.push(cohort_publication::RootCheckpointGateMember {
+            epoch,
+            bootstrap: carried,
+            terminal,
+        });
+        carried = terminal;
+    }
+    let mut ordered_checkpoints = evidence
+        .checkpoints
+        .iter()
+        .map(|checkpoint| {
+            let position = journal_lines
+                .iter()
+                .position(|line| *line == checkpoint.journal_message)
+                .expect("every recovery checkpoint journal line was required exactly once");
+            (position, checkpoint.summary.slot)
+        })
+        .collect::<Vec<_>>();
+    ordered_checkpoints.sort_unstable_by_key(|(position, _)| *position);
+    if ordered_checkpoints
+        .windows(2)
+        .any(|pair| pair[0].1 > pair[1].1)
+    {
+        return Err(
+            "recovery checkpoint slots are not monotonic in the producer journal".to_string(),
+        );
+    }
+    for epoch in evidence.start_epoch..=evidence.end_epoch {
+        let terminal = evidence
+            .checkpoints
+            .iter()
+            .find(|checkpoint| checkpoint.kind == "terminal" && checkpoint.epoch == Some(epoch))
+            .expect("one terminal checkpoint per epoch was required");
+        let completion = evidence
+            .archive_completions
+            .iter()
+            .find(|completion| completion.epoch == epoch)
+            .expect("one archive completion per epoch was required");
+        let terminal_position = journal_lines
+            .iter()
+            .position(|line| *line == terminal.journal_message)
+            .expect("terminal checkpoint journal line was required exactly once");
+        let completion_position = journal_lines
+            .iter()
+            .position(|line| *line == completion.journal_message)
+            .expect("archive completion journal line was required exactly once");
+        if completion_position <= terminal_position {
+            return Err(format!(
+                "epoch {epoch} archive completion precedes its terminal checkpoint"
+            ));
+        }
+        if epoch < evidence.end_epoch {
+            let next_terminal_position = evidence
+                .checkpoints
+                .iter()
+                .find(|checkpoint| {
+                    checkpoint.kind == "terminal" && checkpoint.epoch == Some(epoch + 1)
+                })
+                .and_then(|checkpoint| {
+                    journal_lines
+                        .iter()
+                        .position(|line| *line == checkpoint.journal_message)
+                })
+                .expect("next terminal checkpoint journal line was required exactly once");
+            if completion_position >= next_terminal_position {
+                return Err(format!(
+                    "epoch {epoch} archive completion does not precede the next terminal checkpoint"
+                ));
+            }
+        }
+    }
+    Ok(cohort_publication::RootCheckpointGateEvidence {
+        kind: cohort_publication::ROOT_CHECKPOINT_GATE_KIND.to_owned(),
+        version: cohort_publication::ROOT_CHECKPOINT_GATE_VERSION,
+        verified_manifest_checkpoints: plan
+            .root_checkpoints
+            .iter()
+            .map(
+                |checkpoint| cohort_publication::VerifiedManifestCheckpoint {
+                    slot: checkpoint.slot,
+                    accounts_hash: checkpoint
+                        .accounts_hash
+                        .parse::<Hash>()
+                        .expect("cohort plan checkpoint hash was validated")
+                        .to_bytes(),
+                },
+            )
+            .collect(),
+        members,
+    })
+}
+
+fn write_or_validate_recovery_receipt(
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<[u8; 32], String> {
+    use std::{
+        io::Write as _,
+        os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
+    };
+
+    if !path.is_absolute() || path.file_name().is_none() {
+        return Err("recovery receipt path must be an absolute file path".to_string());
+    }
+    let parent = path
+        .parent()
+        .expect("absolute file path has a parent")
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize recovery receipt parent: {error}"))?;
+    if parent != path.parent().expect("absolute file path has a parent") {
+        return Err("recovery receipt parent must be canonical".to_string());
+    }
+    let parent_metadata = fs::symlink_metadata(&parent)
+        .map_err(|error| format!("failed to inspect recovery receipt parent: {error}"))?;
+    if !parent_metadata.file_type().is_dir()
+        || parent_metadata.uid() != effective_user_id()
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("recovery receipt parent must be caller-owned and owner-only".to_string());
+    }
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("failed to encode recovery receipt: {error}"))?;
+    bytes.push(b'\n');
+    let expected_digest: [u8; 32] = Sha256::digest(&bytes).into();
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            let (existing, digest) =
+                read_bound_recovery_file(path, MAX_UNRECEIPTED_RECOVERY_EVIDENCE_BYTES, false)?;
+            if existing != bytes || digest != expected_digest {
+                return Err("existing recovery receipt does not match this validation".to_string());
+            }
+            return Ok(digest);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!("failed to inspect recovery receipt: {error}"));
+        }
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| format!("failed to create recovery receipt: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("failed to persist recovery receipt: {error}"))?;
+    drop(file);
+    fs::File::open(&parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| format!("failed to sync recovery receipt parent: {error}"))?;
+    Ok(expected_digest)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_unreceipted_root_cohort_recovery(
+    start_epoch: u64,
+    end_epoch: u64,
+    destination: &BoundDestination,
+    receipt_directory: &Path,
+    evidence_path: &Path,
+    publish_through_epoch: u64,
+    plan: &RootCheckpointCohortPlan,
+    selection: compatibility::RuntimeSelection,
+    shutdown: Arc<AtomicBool>,
+) -> Result<cohort_publication::CompletedPublication, String> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    destination.revalidate()?;
+    let (evidence_bytes, evidence_sha256) =
+        read_bound_recovery_file(evidence_path, MAX_UNRECEIPTED_RECOVERY_EVIDENCE_BYTES, true)?;
+    let evidence: UnreceiptedCohortRecoveryEvidence = serde_json::from_slice(&evidence_bytes)
+        .map_err(|error| format!("invalid unreceipted recovery evidence: {error}"))?;
+    if evidence.schema != UNRECEIPTED_COHORT_RECOVERY_SCHEMA
+        || evidence.start_epoch != start_epoch
+        || evidence.end_epoch != end_epoch
+        || evidence.manifest_fingerprint != plan.fingerprint
+        || evidence.remote_mutations
+        || evidence.r2_mutations
+        || evidence.recorded_at_utc.is_empty()
+    {
+        return Err("unreceipted recovery evidence does not bind this cohort".to_string());
+    }
+    let fields = systemd_recovery_fields(&evidence.producer.unit, "horizon-qualify-")?;
+    if evidence.producer.expected_exec_main_code != 2
+        || evidence.producer.expected_exec_main_status != libc::SIGTERM
+    {
+        return Err(
+            "unreceipted recovery requires the bound producer to have been stopped by SIGTERM"
+                .to_string(),
+        );
+    }
+    let expected_fields = [
+        ("LoadState", "loaded".to_string()),
+        ("ActiveState", "inactive".to_string()),
+        ("SubState", "dead".to_string()),
+        ("Result", "success".to_string()),
+        ("MainPID", "0".to_string()),
+        ("InvocationID", evidence.producer.invocation_id.clone()),
+        ("NRestarts", "0".to_string()),
+        (
+            "ExecMainCode",
+            evidence.producer.expected_exec_main_code.to_string(),
+        ),
+        (
+            "ExecMainStatus",
+            evidence.producer.expected_exec_main_status.to_string(),
+        ),
+        ("ExecStart", evidence.producer.expected_exec_start.clone()),
+    ];
+    if expected_fields
+        .iter()
+        .any(|(name, expected)| fields.get(*name) != Some(expected))
+    {
+        return Err(format!(
+            "original producer does not remain at the bound terminal state: {fields:?}"
+        ));
+    }
+    let node = evidence.producer.node_path.to_string_lossy();
+    let expected_exec_binding = format!("path={node} ; argv[]={node}");
+    let expected_range_and_destination = format!(
+        " {start_epoch}-{end_epoch} {} --verify --root-checkpoint-cohort ",
+        destination.path().display()
+    );
+    if !evidence
+        .producer
+        .expected_exec_start
+        .contains(&expected_exec_binding)
+        || !evidence
+            .producer
+            .expected_exec_start
+            .contains(&expected_range_and_destination)
+        || !evidence.producer.expected_exec_start.contains(&format!(
+            "--cohort-manifest-fingerprint={} ",
+            plan.fingerprint
+        ))
+    {
+        return Err(
+            "original producer ExecStart does not bind the exact node, cohort, destination, and manifest fingerprint"
+                .to_string(),
+        );
+    }
+    if hash_bound_recovery_file(&evidence.producer.node_path)?
+        != parse_lower_sha256(
+            &evidence.producer.node_sha256,
+            "original producer node SHA-256",
+        )?
+    {
+        return Err("original producer node digest changed".to_string());
+    }
+    let (guard_sha256, guard_journal_sha256) = validate_guard_trip_receipt(&evidence)?;
+    let journal = exact_invocation_journal(&evidence.producer.invocation_id)?;
+    let journal_sha256: [u8; 32] = Sha256::digest(journal.as_bytes()).into();
+    let gate = build_unreceipted_recovery_gate(&evidence, plan, &journal)?;
+
+    let scope = private_epoch_scope(destination.path())?;
+    let expected_parent = scope
+        .join("work")
+        .join(format!("root-cohort-{start_epoch}-{end_epoch}"));
+    let source_run = evidence
+        .source_run
+        .canonicalize()
+        .map_err(|error| format!("failed to canonicalize source cohort run: {error}"))?;
+    if source_run != evidence.source_run || source_run.parent() != Some(expected_parent.as_path()) {
+        return Err("source cohort run escaped the bound private destination scope".to_string());
+    }
+    let source_metadata = fs::symlink_metadata(&source_run)
+        .map_err(|error| format!("failed to inspect source cohort run: {error}"))?;
+    if !source_metadata.file_type().is_dir()
+        || source_metadata.uid() != effective_user_id()
+        || source_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err("source cohort run has an unsafe identity".to_string());
+    }
+    let state_path = source_run.join(COHORT_RUN_STATE_FILE);
+    let (state_bytes, state_sha256) =
+        read_bound_recovery_file(&state_path, MAX_COHORT_RUN_STATE_BYTES, false)?;
+    if state_sha256 != parse_lower_sha256(&evidence.source_state_sha256, "source state SHA-256")? {
+        return Err("source cohort state digest mismatch".to_string());
+    }
+    let state: CohortRunState = serde_json::from_slice(&state_bytes)
+        .map_err(|error| format!("invalid source cohort state: {error}"))?;
+    if state.schema != "jetstreamer-root-cohort-run-v1"
+        || state.status != "running-private"
+        || state.start_epoch != start_epoch
+        || state.end_epoch != end_epoch
+        || state.manifest_fingerprint != plan.fingerprint
+    {
+        return Err("source cohort state does not bind this recovery".to_string());
+    }
+
+    let completions = evidence
+        .archive_completions
+        .iter()
+        .map(|item| (item.epoch, item))
+        .collect::<BTreeMap<_, _>>();
+    if completions.len() != usize::try_from(end_epoch - start_epoch + 1).unwrap_or(usize::MAX) {
+        return Err("recovery evidence has the wrong archive completion count".to_string());
+    }
+    let archives = source_run.join("archives");
+    let archive_entries = fs::read_dir(&archives)
+        .map_err(|error| format!("failed to inspect source archive directory: {error}"))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.file_name())
+                .map_err(|error| format!("failed to inspect source archive entry: {error}"))
+        })
+        .collect::<Result<HashSet<_>, _>>()?;
+    let expected_entries = (start_epoch..=end_epoch)
+        .map(|epoch| OsString::from(format!("epoch-{epoch}.jet")))
+        .collect::<HashSet<_>>();
+    if archive_entries != expected_entries {
+        return Err("source archive directory has unexpected membership".to_string());
+    }
+
+    let mut recovered = Vec::new();
+    for epoch in start_epoch..=end_epoch {
+        if shutdown.load(Ordering::SeqCst) {
+            return Err("unreceipted cohort recovery was interrupted".to_string());
+        }
+        let completion = completions
+            .get(&epoch)
+            .ok_or_else(|| format!("missing archive completion evidence for epoch {epoch}"))?;
+        let source_archive = archives.join(format!("epoch-{epoch}.jet"));
+        let metadata = fs::symlink_metadata(&source_archive)
+            .map_err(|error| format!("failed to inspect epoch {epoch} source archive: {error}"))?;
+        if !metadata.file_type().is_file()
+            || metadata.uid() != effective_user_id()
+            || metadata.nlink() != 1
+            || metadata.len() != completion.archive_size
+        {
+            return Err(format!(
+                "epoch {epoch} source archive identity or size mismatch"
+            ));
+        }
+        let destination_archive = destination.path().join(format!("epoch-{epoch}.jet"));
+        require_recovery_destination_namespace_absent(&destination_archive)?;
+        let mut archive_chain = ArchiveChainEvidence::default();
+        let validated = validated_cohort_epoch_archive(
+            &source_archive,
+            epoch,
+            selection.admission == compatibility::AdmissionLevel::Candidate,
+            Some(&shutdown),
+            Some(&mut archive_chain),
+        )?
+        .ok_or_else(|| format!("source archive is incomplete: {}", source_archive.display()))?;
+        let provenance = read_bound_cohort_provenance(&source_archive, validated)?;
+        recovered.push(RecoveredCohortEpoch {
+            epoch,
+            source_archive,
+            destination_archive,
+            provenance,
+            archive_chain,
+            validated,
+        });
+    }
+    validate_recovered_cohort_gate(plan, &recovered, &gate)?;
+    destination.revalidate()?;
+    if shutdown.load(Ordering::SeqCst) {
+        return Err("unreceipted cohort recovery was interrupted before publication".to_string());
+    }
+
+    let validated_members = recovered
+        .iter()
+        .map(|item| {
+            let size = fs::metadata(&item.source_archive)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            serde_json::json!({
+                "epoch": item.epoch,
+                "path": item.source_archive,
+                "size": size,
+                "sha256": jetstreamer_node::segment_manifest::sha256_hex_string(
+                    &item.validated.sha256
+                ),
+            })
+        })
+        .collect::<Vec<_>>();
+    let recovery_receipt_value = serde_json::json!({
+        "schema": UNRECEIPTED_COHORT_RECOVERY_RECEIPT_SCHEMA,
+        "evidence": evidence_path,
+        "evidence_sha256": jetstreamer_node::segment_manifest::sha256_hex_string(
+            &evidence_sha256
+        ),
+        "journal_invocation_id": evidence.producer.invocation_id,
+        "journal_sha256": jetstreamer_node::segment_manifest::sha256_hex_string(
+            &journal_sha256
+        ),
+        "guard_receipt": evidence.guard.receipt_path,
+        "guard_receipt_sha256": jetstreamer_node::segment_manifest::sha256_hex_string(
+            &guard_sha256
+        ),
+        "guard_invocation_id": evidence.guard.expected_guard_invocation_id,
+        "guard_journal_sha256": jetstreamer_node::segment_manifest::sha256_hex_string(
+            &guard_journal_sha256
+        ),
+        "source_run": source_run,
+        "source_state_sha256": jetstreamer_node::segment_manifest::sha256_hex_string(
+            &state_sha256
+        ),
+        "manifest_fingerprint": plan.fingerprint,
+        "epochs": [start_epoch, end_epoch],
+        "validated_members": validated_members,
+        "root_checkpoint_gate": gate,
+        "complete_archive_reread_passed": true,
+        "publication_authorized": true,
+        "remote_mutations": false,
+        "r2_mutations": false,
+    });
+    let recovery_receipt_sha256 =
+        write_or_validate_recovery_receipt(&evidence.recovery_receipt, &recovery_receipt_value)?;
+    info!(
+        "unreceipted cohort recovery validation receipt {} is durable (sha256:{})",
+        evidence.recovery_receipt.display(),
+        jetstreamer_node::segment_manifest::sha256_hex_string(&recovery_receipt_sha256)
+    );
+
+    let (publication_epochs, publication_gate) =
+        verified_cohort_publication_prefix(start_epoch, end_epoch, publish_through_epoch, &gate)?;
+    let items = recovered
+        .iter()
+        .filter(|archive| archive.epoch <= publish_through_epoch)
+        .map(
+            |archive| jetstreamer_node::archive_publish::ArchiveBatchItem {
+                epoch: archive.epoch,
+                staged_archive: archive.source_archive.clone(),
+                destination_archive: archive.destination_archive.clone(),
+                evidence: archive.validated,
+            },
+        )
+        .collect::<Vec<_>>();
+    let expected = recovered
+        .iter()
+        .filter(|archive| archive.epoch <= publish_through_epoch)
+        .map(|archive| cohort_publication::ExpectedCohortArchive {
+            epoch: archive.epoch,
+            destination_archive: &archive.destination_archive,
+            sha256: archive.validated.sha256,
+        })
+        .collect::<Vec<_>>();
+    let manifest_fingerprint = manifest_fingerprint_digest(&plan.fingerprint)?;
+    let gate_context = cohort_publication::encode_root_checkpoint_gate_context(
+        manifest_fingerprint,
+        &publication_epochs,
+        &publication_gate,
+    )?;
+    let publication =
+        jetstreamer_node::archive_publish::publish_verified_archive_batch_if_absent_with_context_and_lock_timeout(
+            manifest_fingerprint,
+            &publication_epochs,
+            &items,
+            &gate_context,
+            COHORT_IMPORT_WRITER_LOCK_TIMEOUT,
+        )
+        .map_err(|error| {
+            format!(
+                "transactional unreceipted cohort recovery failed (commit_state={:?}, recovery={:?}): {error}",
+                error.commit_state(),
+                error.recovery_directory()
+            )
+        })?;
+    let completed = cohort_publication::finish_root_checkpoint_publication(
+        destination.publication_binding(),
+        receipt_directory,
+        manifest_fingerprint,
+        &expected,
+        &publication,
+        &publication_gate,
+    )?;
+    CohortRunDirectory::resume(
+        expected_parent,
+        source_run,
+        start_epoch,
+        end_epoch,
+        &plan.fingerprint,
+    )?
+    .cleanup_after_commit()?;
+    Ok(completed)
 }
 
 #[allow(clippy::too_many_arguments)] // recovery keeps every bound capability explicit at the call site
@@ -17490,9 +18757,11 @@ async fn main() {
     let mut root_checkpoint_cohort = false;
     let mut recover_staged_only = false;
     let mut recover_staged_cohort_only = false;
+    let mut recover_unreceipted_root_cohort_only = false;
     let mut cohort_manifest: Option<PathBuf> = None;
     let mut cohort_manifest_fingerprint: Option<String> = None;
     let mut source_cohort_receipt: Option<PathBuf> = None;
+    let mut unreceipted_recovery_evidence: Option<PathBuf> = None;
     let mut publish_through_epoch: Option<u64> = None;
     for arg in args {
         if arg == "--verify" {
@@ -17549,6 +18818,12 @@ async fn main() {
                 exit(2);
             }
             recover_staged_cohort_only = true;
+        } else if arg == "--recover-unreceipted-root-cohort-only" {
+            if recover_unreceipted_root_cohort_only {
+                eprintln!("duplicate --recover-unreceipted-root-cohort-only option");
+                exit(2);
+            }
+            recover_unreceipted_root_cohort_only = true;
         } else if let Some(path) = arg.strip_prefix("--cohort-manifest=") {
             if cohort_manifest.replace(PathBuf::from(path)).is_some() {
                 eprintln!("duplicate --cohort-manifest option");
@@ -17565,6 +18840,14 @@ async fn main() {
         } else if let Some(path) = arg.strip_prefix("--source-cohort-receipt=") {
             if source_cohort_receipt.replace(PathBuf::from(path)).is_some() {
                 eprintln!("duplicate --source-cohort-receipt option");
+                exit(2);
+            }
+        } else if let Some(path) = arg.strip_prefix("--unreceipted-recovery-evidence=") {
+            if unreceipted_recovery_evidence
+                .replace(PathBuf::from(path))
+                .is_some()
+            {
+                eprintln!("duplicate --unreceipted-recovery-evidence option");
                 exit(2);
             }
         } else if let Some(epoch) = arg.strip_prefix("--publish-through-epoch=") {
@@ -17632,6 +18915,7 @@ async fn main() {
         inherited_epoch_lease,
         root_checkpoint_cohort
             || recover_staged_cohort_only
+            || recover_unreceipted_root_cohort_only
             || horizon_output.is_some()
             || qualification_end_slot.is_some()
             || epoch_hashes.is_some()
@@ -17655,8 +18939,35 @@ async fn main() {
         cohort_manifest_fingerprint.is_some(),
         source_cohort_receipt.is_some(),
         publish_through_epoch,
+        recover_unreceipted_root_cohort_only,
         recover_staged_only
+            || recover_unreceipted_root_cohort_only
             || root_checkpoint_cohort
+            || horizon_output.is_some()
+            || qualification_end_slot.is_some()
+            || epoch_hashes.is_some()
+            || snapshot_archive_override.is_some()
+            || range_info.is_some()
+            || replay_scratch.is_some(),
+    ) {
+        eprintln!("{error}");
+        exit(2);
+    }
+    if let Err(error) = validate_unreceipted_cohort_recovery_mode(
+        recover_unreceipted_root_cohort_only,
+        start_epoch,
+        end_epoch,
+        explicit_verify,
+        verify_option_count,
+        inherited_epoch_lease,
+        cohort_manifest.is_some(),
+        cohort_manifest_fingerprint.is_some(),
+        unreceipted_recovery_evidence.is_some(),
+        publish_through_epoch,
+        recover_staged_only
+            || recover_staged_cohort_only
+            || root_checkpoint_cohort
+            || source_cohort_receipt.is_some()
             || horizon_output.is_some()
             || qualification_end_slot.is_some()
             || epoch_hashes.is_some()
@@ -17694,6 +19005,7 @@ async fn main() {
             exit(2);
         }
     } else if !recover_staged_cohort_only
+        && !recover_unreceipted_root_cohort_only
         && (cohort_manifest.is_some() || cohort_manifest_fingerprint.is_some())
     {
         eprintln!(
@@ -17703,6 +19015,12 @@ async fn main() {
     }
     if !recover_staged_cohort_only && source_cohort_receipt.is_some() {
         eprintln!("--source-cohort-receipt requires --recover-staged-cohort-only");
+        exit(2);
+    }
+    if !recover_unreceipted_root_cohort_only && unreceipted_recovery_evidence.is_some() {
+        eprintln!(
+            "--unreceipted-recovery-evidence requires --recover-unreceipted-root-cohort-only"
+        );
         exit(2);
     }
     let cohort_bootstrap_override = root_checkpoint_cohort
@@ -17843,7 +19161,10 @@ async fn main() {
         }
         return;
     }
-    let cohort_runtime = if root_checkpoint_cohort || recover_staged_cohort_only {
+    let cohort_runtime = if root_checkpoint_cohort
+        || recover_staged_cohort_only
+        || recover_unreceipted_root_cohort_only
+    {
         match root_checkpoint_cohort_runtime(start_epoch, end_epoch, allow_candidate_runtime) {
             Ok(selection) => Some(selection),
             Err(err) => {
@@ -17854,7 +19175,10 @@ async fn main() {
     } else {
         None
     };
-    let cohort_plan = if root_checkpoint_cohort || recover_staged_cohort_only {
+    let cohort_plan = if root_checkpoint_cohort
+        || recover_staged_cohort_only
+        || recover_unreceipted_root_cohort_only
+    {
         let manifest_path = cohort_manifest
             .as_deref()
             .expect("cohort manifest option was required");
@@ -17883,11 +19207,11 @@ async fn main() {
     } else {
         None
     };
-    if let (Some(plan), Some(path)) = (cohort_plan.as_ref(), cohort_bootstrap_override.as_deref()) {
-        if let Err(error) = validate_cohort_bootstrap_override(path, &plan.bootstrap) {
-            eprintln!("error: {error}");
-            exit(1);
-        }
+    if let (Some(plan), Some(path)) = (cohort_plan.as_ref(), cohort_bootstrap_override.as_deref())
+        && let Err(error) = validate_cohort_bootstrap_override(path, &plan.bootstrap)
+    {
+        eprintln!("error: {error}");
+        exit(1);
     }
     if recover_staged_cohort_only {
         let receipt_directory = batch_receipt_directory
@@ -17921,6 +19245,43 @@ async fn main() {
             }
             Err(error) => {
                 eprintln!("error: {error}; cohort import remains fail-closed");
+                exit(1);
+            }
+        }
+        return;
+    }
+    if recover_unreceipted_root_cohort_only {
+        let receipt_directory = batch_receipt_directory
+            .as_deref()
+            .expect("top-level unreceipted recovery has a private receipt directory");
+        match run_unreceipted_root_cohort_recovery(
+            start_epoch,
+            end_epoch,
+            &destination_binding,
+            receipt_directory,
+            unreceipted_recovery_evidence
+                .as_deref()
+                .expect("unreceipted recovery evidence option was required"),
+            publish_through_epoch.unwrap_or(end_epoch),
+            cohort_plan.as_ref().expect("cohort plan was validated"),
+            cohort_runtime.expect("cohort runtime was validated"),
+            shutdown.clone(),
+        ) {
+            Ok(publication) => {
+                info!(
+                    "recovered unreceipted root-checkpoint cohort {}-{} through epoch {} ({} archive(s)) in transaction {}; receipt {} is durable",
+                    start_epoch,
+                    end_epoch,
+                    publish_through_epoch.unwrap_or(end_epoch),
+                    publication.archive_count,
+                    jetstreamer_node::segment_manifest::sha256_hex_string(
+                        &publication.transaction_id
+                    ),
+                    publication.receipt_path.display()
+                );
+            }
+            Err(error) => {
+                eprintln!("error: {error}; unreceipted cohort recovery remains fail-closed");
                 exit(1);
             }
         }
@@ -19633,6 +20994,300 @@ mod early_snapshot_tests {
         )
     }
 
+    fn unreceipted_test_summary(
+        slot: Slot,
+        accounts_hash: Hash,
+        last_blockhash: Hash,
+    ) -> UnreceiptedCheckpointSummary {
+        UnreceiptedCheckpointSummary {
+            slot,
+            bank_hash: Hash::new_from_array([(slot % 251) as u8; 32]).to_string(),
+            accounts_hash: accounts_hash.to_string(),
+            last_blockhash: last_blockhash.to_string(),
+            capitalization: slot + 10,
+            transaction_count: slot + 20,
+            tick_height: slot + 30,
+            slot_complete: true,
+            write_count: slot + 40,
+            next_write_version: slot + 50,
+        }
+    }
+
+    fn unreceipted_checkpoint_line(label: &str, summary: &UnreceiptedCheckpointSummary) -> String {
+        format!(
+            "[{label} INFO  jetstreamer_node::historical_replay] historical checkpoint slot={} bank_hash={} accounts_hash={} last_blockhash={} capitalization={} transactions={} tick_height={} complete={} writes={} next_write_version={}",
+            summary.slot,
+            summary.bank_hash,
+            summary.accounts_hash,
+            summary.last_blockhash,
+            summary.capitalization,
+            summary.transaction_count,
+            summary.tick_height,
+            summary.slot_complete,
+            summary.write_count,
+            summary.next_write_version,
+        )
+    }
+
+    fn unreceipted_recovery_test_fixture() -> (
+        RootCheckpointCohortPlan,
+        UnreceiptedCohortRecoveryEvidence,
+        String,
+    ) {
+        let (report, fingerprint) = cohort_manifest_report(b"recovery evidence fixture");
+        let selection = root_checkpoint_cohort_runtime(17, 19, true).unwrap();
+        let plan = root_checkpoint_cohort_plan_from_report(report, &fingerprint, 17, 19, selection)
+            .unwrap();
+        let bootstrap = unreceipted_test_summary(
+            plan.bootstrap.slot,
+            plan.bootstrap.accounts_hash.parse().unwrap(),
+            Hash::new_from_array([0x31; 32]),
+        );
+        let terminal17 = unreceipted_test_summary(
+            epoch_to_slot_range(17).1,
+            Hash::new_from_array([0x41; 32]),
+            Hash::new_from_array([0x51; 32]),
+        );
+        let terminal18 = unreceipted_test_summary(
+            epoch_to_slot_range(18).1,
+            Hash::new_from_array([0x42; 32]),
+            Hash::new_from_array([0x52; 32]),
+        );
+        let manifest = unreceipted_test_summary(
+            plan.root_checkpoints[0].slot,
+            plan.root_checkpoints[0].accounts_hash.parse().unwrap(),
+            Hash::new_from_array([0x61; 32]),
+        );
+        let terminal19 = unreceipted_test_summary(
+            epoch_to_slot_range(19).1,
+            Hash::new_from_array([0x43; 32]),
+            Hash::new_from_array([0x53; 32]),
+        );
+        let checkpoints = vec![
+            UnreceiptedCheckpointEvidence {
+                kind: "bootstrap".to_string(),
+                epoch: Some(17),
+                journal_message: unreceipted_checkpoint_line("bootstrap", &bootstrap),
+                summary: bootstrap,
+            },
+            UnreceiptedCheckpointEvidence {
+                kind: "terminal".to_string(),
+                epoch: Some(17),
+                journal_message: unreceipted_checkpoint_line("terminal17", &terminal17),
+                summary: terminal17,
+            },
+            UnreceiptedCheckpointEvidence {
+                kind: "terminal".to_string(),
+                epoch: Some(18),
+                journal_message: unreceipted_checkpoint_line("terminal18", &terminal18),
+                summary: terminal18,
+            },
+            UnreceiptedCheckpointEvidence {
+                kind: "manifest".to_string(),
+                epoch: None,
+                journal_message: unreceipted_checkpoint_line("manifest", &manifest),
+                summary: manifest,
+            },
+            UnreceiptedCheckpointEvidence {
+                kind: "terminal".to_string(),
+                epoch: Some(19),
+                journal_message: unreceipted_checkpoint_line("terminal19", &terminal19),
+                summary: terminal19,
+            },
+        ];
+        let completion = |epoch, size| UnreceiptedArchiveCompletionEvidence {
+            epoch,
+            archive_size: size,
+            journal_message: format!(
+                "[archive{epoch} INFO  jetstreamer_node::horizon] horizon archive complete: slots=432000 blocks=1 bytes={size} (payload 1 uncompressed)"
+            ),
+        };
+        let archive_completions = vec![
+            completion(17, 101),
+            completion(18, 102),
+            completion(19, 103),
+        ];
+        let bound = format!(
+            "[bound INFO  jetstreamer_node] root-checkpoint cohort 17-19 bound sealed preflight {fingerprint}"
+        );
+        let verification = "[verify INFO  jetstreamer_node] root-checkpoint cohort verification bound its bootstrap and 1 root checkpoint(s) through epoch 19".to_string();
+        let firehose17 =
+            "[firehose17 INFO  jetstreamer::firehose] 🚒 firehose finished successfully."
+                .to_string();
+        let firehose18 =
+            "[firehose18 INFO  jetstreamer::firehose] 🚒 firehose finished successfully."
+                .to_string();
+        let firehose19 =
+            "[firehose19 INFO  jetstreamer::firehose] 🚒 firehose finished successfully."
+                .to_string();
+        let retained17 = "[retained17 INFO  jetstreamer_node] root-checkpoint cohort retained validated epoch 17 privately; publication remains closed".to_string();
+        let retained18 = "[retained18 INFO  jetstreamer_node] root-checkpoint cohort retained validated epoch 18 privately; publication remains closed".to_string();
+        let snapshot_complete =
+            "[snapshot INFO  jetstreamer_node] snapshot verification complete".to_string();
+        let journal_lines = vec![
+            bound.clone(),
+            verification.clone(),
+            checkpoints[0].journal_message.clone(),
+            firehose17.clone(),
+            checkpoints[1].journal_message.clone(),
+            archive_completions[0].journal_message.clone(),
+            retained17.clone(),
+            firehose18.clone(),
+            checkpoints[2].journal_message.clone(),
+            archive_completions[1].journal_message.clone(),
+            retained18.clone(),
+            checkpoints[3].journal_message.clone(),
+            firehose19.clone(),
+            checkpoints[4].journal_message.clone(),
+            snapshot_complete.clone(),
+            archive_completions[2].journal_message.clone(),
+        ];
+        let evidence = UnreceiptedCohortRecoveryEvidence {
+            schema: UNRECEIPTED_COHORT_RECOVERY_SCHEMA.to_string(),
+            recorded_at_utc: "2026-10-13T00:00:00Z".to_string(),
+            start_epoch: 17,
+            end_epoch: 19,
+            manifest_fingerprint: fingerprint,
+            source_run: PathBuf::from("/private/run"),
+            source_state_sha256: "00".repeat(32),
+            producer: UnreceiptedRecoveryProducerEvidence {
+                unit: "horizon-qualify-test.service".to_string(),
+                invocation_id: "11".repeat(16),
+                node_path: PathBuf::from("/immutable/jetstreamer-node"),
+                node_sha256: "22".repeat(32),
+                expected_exec_start: "sealed exec".to_string(),
+                expected_exec_main_code: 2,
+                expected_exec_main_status: libc::SIGTERM,
+            },
+            guard: UnreceiptedRecoveryGuardEvidence {
+                receipt_path: PathBuf::from("/immutable/guard.json"),
+                receipt_sha256: "33".repeat(32),
+                expected_guard_unit: "horizon-monitor-test.service".to_string(),
+                expected_guard_invocation_id: "44".repeat(16),
+                expected_guard_timer: "horizon-monitor-test.timer".to_string(),
+            },
+            checkpoints,
+            archive_completions,
+            required_journal_messages: vec![
+                bound,
+                verification,
+                firehose17,
+                firehose18,
+                firehose19,
+                retained17,
+                retained18,
+                snapshot_complete,
+            ],
+            recovery_receipt: PathBuf::from("/private/recovery.json"),
+            remote_mutations: false,
+            r2_mutations: false,
+        };
+        (plan, evidence, format!("{}\n", journal_lines.join("\n")))
+    }
+
+    #[test]
+    fn unreceipted_recovery_gate_mechanically_binds_journal_and_order() {
+        let (plan, evidence, journal) = unreceipted_recovery_test_fixture();
+        let gate = build_unreceipted_recovery_gate(&evidence, &plan, &journal).unwrap();
+        assert_eq!(
+            gate.members
+                .iter()
+                .map(|member| member.epoch)
+                .collect::<Vec<_>>(),
+            [17, 18, 19]
+        );
+
+        let mut mistranscribed = evidence.clone();
+        mistranscribed.checkpoints[4].summary.capitalization += 1;
+        let error = build_unreceipted_recovery_gate(&mistranscribed, &plan, &journal).unwrap_err();
+        assert!(error.contains("mechanically bound"), "{error}");
+
+        let duplicated = format!("{journal}{}\n", evidence.checkpoints[0].journal_message);
+        let error = build_unreceipted_recovery_gate(&evidence, &plan, &duplicated).unwrap_err();
+        assert!(error.contains("occurs 2 times"), "{error}");
+
+        let mut wrong_size = evidence.clone();
+        wrong_size.archive_completions[1].archive_size += 1;
+        let error = build_unreceipted_recovery_gate(&wrong_size, &plan, &journal).unwrap_err();
+        assert!(error.contains("completion size"), "{error}");
+
+        let missing = journal
+            .lines()
+            .filter(|line| !line.contains("snapshot verification complete"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let error = build_unreceipted_recovery_gate(&evidence, &plan, &missing).unwrap_err();
+        assert!(error.contains("occurs 0 times"), "{error}");
+
+        let mut reordered = journal.lines().map(str::to_string).collect::<Vec<_>>();
+        let terminal = reordered
+            .iter()
+            .position(|line| line == &evidence.checkpoints[1].journal_message)
+            .unwrap();
+        let completion = reordered
+            .iter()
+            .position(|line| line == &evidence.archive_completions[0].journal_message)
+            .unwrap();
+        reordered.swap(terminal, completion);
+        let error =
+            build_unreceipted_recovery_gate(&evidence, &plan, &reordered.join("\n")).unwrap_err();
+        assert!(
+            error.contains("precedes its terminal checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unreceipted_recovery_guard_value_rejects_wrong_producer_binding() {
+        let (_, evidence, _) = unreceipted_recovery_test_fixture();
+        let receipt = serde_json::json!({
+            "schema": "jetstreamer-historical-performance-guard-trip-v1",
+            "timer_unit": "horizon-monitor-test.timer",
+            "expected_invocations": {
+                "horizon-qualify-test.service": "11111111111111111111111111111111"
+            },
+            "trip_reasons": [
+                "horizon-qualify-test.service has 0 identifiable historical workers"
+            ],
+            "samples": [{
+                "unit": "horizon-qualify-test.service",
+                "invocation_id": "11111111111111111111111111111111",
+                "active_state": "active",
+                "sub_state": "running",
+                "restarts": 0,
+                "worker_count": 0,
+                "worker_pid": null,
+                "worker_vmas": null
+            }]
+        });
+        validate_guard_trip_value(&evidence, &receipt).unwrap();
+        let mut wrong = receipt;
+        wrong["samples"][0]["invocation_id"] = serde_json::json!("00".repeat(16));
+        let error = validate_guard_trip_value(&evidence, &wrong).unwrap_err();
+        assert!(error.contains("zero-worker terminal handoff"), "{error}");
+    }
+
+    #[test]
+    fn unreceipted_recovery_evidence_rejects_unknown_or_missing_fields() {
+        let unknown = br#"{
+            "schema":"jetstreamer-unreceipted-root-cohort-recovery-evidence-v1",
+            "unexpected":true
+        }"#;
+        let error = serde_json::from_slice::<UnreceiptedCohortRecoveryEvidence>(unknown)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `unexpected`"), "{error}");
+
+        let missing = br#"{
+            "schema":"jetstreamer-unreceipted-root-cohort-recovery-evidence-v1",
+            "recorded_at_utc":"2026-10-13T00:00:00Z"
+        }"#;
+        let error = serde_json::from_slice::<UnreceiptedCohortRecoveryEvidence>(missing)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing field"), "{error}");
+    }
+
     #[test]
     fn sealed_cohort_manifest_binds_runtime_roots_and_fingerprint() {
         let bytes = b"audited generation one";
@@ -21275,12 +22930,13 @@ mod early_snapshot_tests {
                 true,
                 None,
                 false,
+                false,
             )
             .is_ok()
         );
         assert!(
             validate_staged_cohort_recovery_mode(
-                false, 0, 0, None, 0, true, false, false, false, None, true,
+                false, 0, 0, None, 0, true, false, false, false, None, false, true,
             )
             .is_ok()
         );
@@ -21297,6 +22953,7 @@ mod early_snapshot_tests {
                 true,
                 None,
                 false,
+                false,
             )
             .unwrap_err();
             assert!(error.contains("nonzero epochs"), "{error}");
@@ -21312,6 +22969,7 @@ mod early_snapshot_tests {
             true,
             true,
             None,
+            false,
             false,
         )
         .unwrap_err();
@@ -21333,6 +22991,7 @@ mod early_snapshot_tests {
                 receipt,
                 None,
                 false,
+                false,
             )
             .unwrap_err();
             assert!(error.contains("source-cohort-receipt"), "{error}");
@@ -21348,6 +23007,7 @@ mod early_snapshot_tests {
             true,
             true,
             None,
+            false,
             true,
         )
         .unwrap_err();
@@ -21367,6 +23027,7 @@ mod early_snapshot_tests {
                     true,
                     Some(publish_through),
                     false,
+                    false,
                 )
                 .is_ok()
             );
@@ -21384,6 +23045,7 @@ mod early_snapshot_tests {
                 true,
                 Some(publish_through),
                 false,
+                false,
             )
             .unwrap_err();
             assert!(error.contains("must be within"), "{error}");
@@ -21400,12 +23062,112 @@ mod early_snapshot_tests {
             true,
             Some(18),
             false,
+            false,
         )
         .unwrap_err();
+        assert!(error.contains("requires a cohort recovery mode"), "{error}");
         assert!(
-            error.contains("requires --recover-staged-cohort-only"),
-            "{error}"
+            validate_staged_cohort_recovery_mode(
+                false,
+                17,
+                19,
+                Some(true),
+                1,
+                false,
+                true,
+                true,
+                true,
+                Some(18),
+                true,
+                false,
+            )
+            .is_ok()
         );
+    }
+
+    #[test]
+    fn unreceipted_cohort_recovery_requires_exact_evidence_and_conflict_free_cli() {
+        assert!(
+            validate_unreceipted_cohort_recovery_mode(
+                true,
+                214,
+                215,
+                Some(true),
+                1,
+                false,
+                true,
+                true,
+                true,
+                Some(215),
+                false,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_unreceipted_cohort_recovery_mode(
+                false, 0, 0, None, 0, true, false, false, false, None, true,
+            )
+            .is_ok()
+        );
+
+        for (manifest, fingerprint, evidence) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let error = validate_unreceipted_cohort_recovery_mode(
+                true,
+                214,
+                215,
+                Some(true),
+                1,
+                false,
+                manifest,
+                fingerprint,
+                evidence,
+                None,
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("unreceipted-recovery-evidence"), "{error}");
+        }
+        for (verify, count) in [(None, 0), (Some(false), 1), (Some(true), 2)] {
+            let error = validate_unreceipted_cohort_recovery_mode(
+                true, 214, 215, verify, count, false, true, true, true, None, false,
+            )
+            .unwrap_err();
+            assert!(error.contains("exactly one explicit --verify"), "{error}");
+        }
+        let error = validate_unreceipted_cohort_recovery_mode(
+            true,
+            214,
+            215,
+            Some(true),
+            1,
+            false,
+            true,
+            true,
+            true,
+            Some(213),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("must be within"), "{error}");
+        let error = validate_unreceipted_cohort_recovery_mode(
+            true,
+            214,
+            215,
+            Some(true),
+            1,
+            false,
+            true,
+            true,
+            true,
+            None,
+            true,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot be combined"), "{error}");
     }
 
     fn make_private_test_directory(path: &Path) {
