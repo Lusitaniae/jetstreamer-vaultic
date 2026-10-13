@@ -55,6 +55,34 @@ const EXPECTED_GAPS: [(u64, u64, u64, u64); EXPECTED_GAP_RUNS] = [
     (89_856_575, 89_856_580, 4, 5),
 ];
 
+const EXPECTED_FINAL_BLOCKHASHES: [(u64, &str); EXPECTED_GAP_RUNS] = [
+    (89_856_117, "FQjwC1FQU3ZRZLbMpywW7FWLyPP9v1XqyBRhk2FgwomW"),
+    (89_856_121, "6nqhS9CEhmvSRKYEVReEVYm7D8Y9cB7fLHz3viqKqc4X"),
+    (89_856_129, "7FksRp5DoPTQiV4aPNxyfiki9qEwHYsdb5vqdXoFbk8n"),
+    (89_856_176, "DTKrDextCoY4UGFRrgLNkoN18qCQMbj7yQhQAtKER418"),
+    (89_856_225, "9rZe97pE6pQuAUDMxFsCqFScsHbESDsnTCs3CjoqpUX2"),
+    (89_856_229, "DUPGW3t1c7LNGEo6Uv6drJXNTpkc9MUK1CFjjzxARD66"),
+    (89_856_233, "RortUbJeW7rftg9iu7LtkcDB5X5ToduYutywKExMZzz"),
+    (89_856_240, "2g4uV3QsNB9zDxoCrUfUjGgAyWUEJzWnreV9TtF46rEA"),
+    (89_856_285, "9MvsKvyFXQ4WHDrwrt2vizXmzKidxSZUCY4NNwfGraL7"),
+    (89_856_300, "EopokmUBgCLdTMcQZeicv26WPh1VWZfFBnFiLadquDJF"),
+    (89_856_312, "qfMNnS939kZVNVcK6Qd94oPa5NLugMNe4NJR3u2F2ak"),
+    (89_856_373, "68nir1Yq9hSeT9Ld7gvpRTkrSd6mKhgmUnBMFN1g4Qs"),
+    (89_856_396, "8s4BqT66w3uSDUFZzyeKQ4bPaUrneDfisnRnmP2xVVfg"),
+    (89_856_405, "4ReJ8KL63nPhcvhnmC6he1JMLTNV4keXpPVY45pDjPDs"),
+    (89_856_422, "DWmWSYxoZ1HMjVobeyBjDrpzaPuKh7GvQzE6oZuUd4w6"),
+    (89_856_429, "DUGRJhxVwBajPu8xsZCb6M2PaBSVZHPtqn2561gqCGTb"),
+    (89_856_433, "3oQCtrkYoum24Kgn1zbNShshCwxVLoBVnYX6tcHD2kWZ"),
+    (89_856_468, "9kzUtEEmpFfbWi7oZar4q84z9b6MY8Ver7dcf6wVYr8c"),
+    (89_856_476, "FEfwMmPZjREAiXBfcy1E8ZCmZNSsn1bioUiXS3rtQoD8"),
+    (89_856_482, "HxyNeeKBtjo5qVTL2qcxk9hjgdrQ9dGW6hBvkNqk2E7Y"),
+    (89_856_496, "J1kkRLhyCAmL6oYqioGGNk4GcSTSmhfnNbRk9iY3BtE8"),
+    (89_856_532, "9pTF4qKNPm5Vv6gMbRaZG7ERsuGCBseptci9cbyUWHTX"),
+    (89_856_552, "2K4Y7qAc6X8fGKLMcg13Y9SJ8wV3Ms5nhMWoDobf5H4c"),
+    (89_856_560, "HzSLfaNJ74QFMijVu9q791fy9M7ZLschXnoQR16yp8Hx"),
+    (89_856_580, "98ijWmbJ4PkwnUsQQA7YrFuB9ziRu97wRTnyLLJFuzpH"),
+];
+
 #[derive(Debug)]
 struct Arguments {
     extraction: PathBuf,
@@ -529,6 +557,8 @@ fn validate_metadata(
         ));
     }
     let expected: BTreeMap<u64, &Gap> = gaps.iter().map(|gap| (gap.post_gap_block, gap)).collect();
+    let expected_blockhashes: BTreeMap<u64, &str> =
+        EXPECTED_FINAL_BLOCKHASHES.into_iter().collect();
     let mut result = BTreeMap::new();
     for response in responses {
         if response.jsonrpc != "2.0" || response.error.is_some() {
@@ -555,6 +585,12 @@ fn validate_metadata(
             &metadata.blockhash,
             &format!("slot {} blockhash", response.id),
         )?;
+        if expected_blockhashes.get(&response.id).copied() != Some(&metadata.blockhash) {
+            return Err(format!(
+                "block metadata differs from the fixed canonical blockhash for slot {}",
+                response.id
+            ));
+        }
         validate_hash(
             &metadata.previous_blockhash,
             &format!("slot {} previous blockhash", response.id),
@@ -1021,8 +1057,20 @@ mod tests {
         for gap in &audit.gaps {
             let mut boundaries = Vec::new();
             for index in 0..gap.boundaries {
-                let bytes = hash_bytes(serial);
-                serial += 1;
+                let bytes = if index + 1 == gap.boundaries {
+                    validate_hash(
+                        EXPECTED_FINAL_BLOCKHASHES
+                            .iter()
+                            .find_map(|(slot, hash)| (*slot == gap.post_gap_block).then_some(*hash))
+                            .unwrap(),
+                        "test canonical blockhash",
+                    )
+                    .unwrap()
+                } else {
+                    let bytes = hash_bytes(serial);
+                    serial += 1;
+                    bytes
+                };
                 boundaries.push(Boundary {
                     tick_ordinal: EXPECTED_TICKS_PER_SLOT * (index + 1),
                     entry_index: index as usize,
@@ -1150,6 +1198,19 @@ mod tests {
             validate_metadata(metadata, &audit.gaps)
                 .unwrap_err()
                 .contains("parent-slot arithmetic")
+        );
+    }
+
+    #[test]
+    fn rejects_substituted_canonical_metadata_blockhash() {
+        let (audit, blockhashes, _) = test_evidence();
+        let mut metadata = test_metadata(&audit, &blockhashes);
+        metadata[0].result.as_mut().unwrap().blockhash =
+            bs58::encode(hash_bytes(99_999)).into_string();
+        assert!(
+            validate_metadata(metadata, &audit.gaps)
+                .unwrap_err()
+                .contains("fixed canonical blockhash")
         );
     }
 
