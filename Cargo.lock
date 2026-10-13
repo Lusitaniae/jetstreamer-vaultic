@@ -4941,6 +4941,7 @@ dependencies = [
  "futures-util",
  "libc",
  "md-5",
+ "reqwest 0.13.3",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -44,6 +44,7 @@ struct Config {
     uploader: PathBuf,
     horizon_directory: PathBuf,
     receipt_directory: PathBuf,
+    public_receipt_directory: PathBuf,
     first_epoch: u64,
     last_epoch: u64,
     poll_seconds: u64,
@@ -62,6 +63,14 @@ struct LocalPair {
     digest: String,
     archive_length: u64,
     archive_modified_nanoseconds: i128,
+}
+
+#[derive(Clone, Debug)]
+struct R2ReceiptEvidence {
+    bucket: String,
+    digest: String,
+    archive_length: u64,
+    archive_etag: String,
 }
 
 #[derive(Debug)]
@@ -122,6 +131,7 @@ fn usage() -> ! {
         "usage: jetstreamer-r2-progressive UPLOADER HORIZON_DIRECTORY RECEIPT_DIRECTORY ",
         "FIRST_EPOCH LAST_EPOCH [--poll-seconds N] [--concurrency N] ",
         "[--legacy-part-size-mib N] [--delete-local] [--local-mutation-lock PATH] ",
+        "--public-receipt-directory DIR ",
         "--full-receipt-directory DIR --full-verifier-sha256 HASH[,HASH...] ",
         "--full-verifier-script-sha256 HASH[,HASH...] --plugin-receipt-directory DIR ",
         "--plugin-pipeline-sha256 HASH[,HASH...] ",
@@ -220,6 +230,7 @@ fn parse_args() -> Result<Config> {
     let mut legacy_part_size_mib = DEFAULT_LEGACY_PART_SIZE_MIB;
     let mut delete_local = false;
     let mut local_mutation_lock = None;
+    let mut public_receipt_directory = None;
     let mut full_directory = None;
     let mut full_verifier = None;
     let mut full_script = None;
@@ -247,6 +258,9 @@ fn parse_args() -> Result<Config> {
             "--delete-local" => delete_local = true,
             "--local-mutation-lock" => {
                 local_mutation_lock = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
+            }
+            "--public-receipt-directory" => {
+                public_receipt_directory = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
             }
             "--full-receipt-directory" => {
                 full_directory = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
@@ -303,6 +317,10 @@ fn parse_args() -> Result<Config> {
     let uploader = absolute_existing_file(uploader, "uploader")?;
     let horizon_directory = absolute_existing_directory(horizon_directory, "Horizon directory")?;
     let receipt_directory = absolute_existing_directory(receipt_directory, "receipt directory")?;
+    let public_receipt_directory = absolute_existing_directory(
+        take_required(public_receipt_directory, "--public-receipt-directory")?,
+        "public receipt directory",
+    )?;
     let full = Gate {
         directory: absolute_existing_directory(
             take_required(full_directory, "--full-receipt-directory")?,
@@ -338,6 +356,7 @@ fn parse_args() -> Result<Config> {
         uploader,
         horizon_directory,
         receipt_directory,
+        public_receipt_directory,
         first_epoch,
         last_epoch,
         poll_seconds,
@@ -453,26 +472,40 @@ fn local_pair(directory: &Path, epoch: u64) -> Result<Option<LocalPair>> {
     }))
 }
 
-fn receipt_matches(path: &Path, epoch: u64, digest: &str, pair: &LocalPair) -> bool {
+fn r2_receipt_evidence(path: &Path, epoch: u64) -> Option<R2ReceiptEvidence> {
     let Ok(Some(bytes)) = read_regular(path, MAX_RECEIPT_BYTES) else {
-        return false;
+        return None;
     };
     let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
-        return false;
+        return None;
     };
-    receipt.get("schema").and_then(Value::as_str) == Some("jetstreamer-horizon-r2-receipt-v1")
+    let valid = receipt.get("schema").and_then(Value::as_str)
+        == Some("jetstreamer-horizon-r2-receipt-v1")
         && receipt.get("epoch").and_then(Value::as_u64) == Some(epoch)
-        && receipt.get("archive_key").and_then(Value::as_str) == Some(&format!("epoch-{epoch}.jet"))
+        && receipt.get("archive_key").and_then(Value::as_str)
+            == Some(&format!("epoch-{epoch}.jet"))
         && receipt.get("checksum_key").and_then(Value::as_str)
             == Some(&format!("epoch-{epoch}.jet.sha256"))
-        && receipt.get("archive_sha256").and_then(Value::as_str) == Some(digest)
-        && receipt.get("archive_length").and_then(Value::as_u64) == Some(pair.archive_length)
+        && receipt
+            .get("archive_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(is_lower_hex_digest)
+        && receipt
+            .get("archive_length")
+            .and_then(Value::as_u64)
+            .is_some_and(|length| length > 0)
+        && receipt
+            .get("archive_etag")
+            .and_then(Value::as_str)
+            .is_some_and(|etag| !etag.is_empty())
+        && receipt
+            .get("bucket")
+            .and_then(Value::as_str)
+            .is_some_and(|bucket| !bucket.is_empty())
         && receipt
             .get("verified_unix_seconds")
             .and_then(Value::as_u64)
-            .is_some_and(|value| {
-                i128::from(value) * 1_000_000_000 >= pair.archive_modified_nanoseconds
-            })
+            .is_some()
         && (receipt
             .get("remote_sha256_readback")
             .and_then(Value::as_bool)
@@ -480,7 +513,78 @@ fn receipt_matches(path: &Path, epoch: u64, digest: &str, pair: &LocalPair) -> b
             || receipt
                 .get("r2_composite_sha256")
                 .and_then(Value::as_str)
-                .is_some())
+                .is_some_and(|digest| !digest.is_empty()));
+    if !valid {
+        return None;
+    }
+    Some(R2ReceiptEvidence {
+        bucket: receipt
+            .get("bucket")
+            .and_then(Value::as_str)
+            .expect("validated bucket")
+            .to_owned(),
+        digest: receipt
+            .get("archive_sha256")
+            .and_then(Value::as_str)
+            .expect("validated digest")
+            .to_owned(),
+        archive_length: receipt
+            .get("archive_length")
+            .and_then(Value::as_u64)
+            .expect("validated archive length"),
+        archive_etag: receipt
+            .get("archive_etag")
+            .and_then(Value::as_str)
+            .expect("validated archive ETag")
+            .to_owned(),
+    })
+}
+
+fn receipt_matches(path: &Path, epoch: u64, digest: &str, pair: &LocalPair) -> bool {
+    let Some(evidence) = r2_receipt_evidence(path, epoch) else {
+        return false;
+    };
+    let Ok(Some(bytes)) = read_regular(path, MAX_RECEIPT_BYTES) else {
+        return false;
+    };
+    let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    evidence.digest == digest
+        && evidence.archive_length == pair.archive_length
+        && receipt
+            .get("verified_unix_seconds")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| {
+                i128::from(value) * 1_000_000_000 >= pair.archive_modified_nanoseconds
+            })
+}
+
+fn public_receipt_matches(path: &Path, epoch: u64, r2: &R2ReceiptEvidence) -> bool {
+    let Ok(Some(bytes)) = read_regular(path, MAX_RECEIPT_BYTES) else {
+        return false;
+    };
+    let Ok(receipt) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    receipt.get("schema").and_then(Value::as_str)
+        == Some("jetstreamer-horizon-r2-public-read-receipt-v1")
+        && receipt.get("bucket").and_then(Value::as_str) == Some(&r2.bucket)
+        && receipt.get("epoch").and_then(Value::as_u64) == Some(epoch)
+        && receipt.get("archive_key").and_then(Value::as_str) == Some(&format!("epoch-{epoch}.jet"))
+        && receipt.get("checksum_key").and_then(Value::as_str)
+            == Some(&format!("epoch-{epoch}.jet.sha256"))
+        && receipt.get("archive_sha256").and_then(Value::as_str) == Some(&r2.digest)
+        && receipt.get("archive_length").and_then(Value::as_u64) == Some(r2.archive_length)
+        && receipt.get("archive_etag").and_then(Value::as_str) == Some(&r2.archive_etag)
+        && receipt
+            .get("public_base_url")
+            .and_then(Value::as_str)
+            .is_some_and(|url| url.starts_with("https://"))
+        && receipt
+            .get("verified_unix_seconds")
+            .and_then(Value::as_u64)
+            .is_some()
 }
 
 fn exact_words(path: &Path, count: usize) -> Result<Option<Vec<String>>> {
@@ -545,8 +649,9 @@ fn adjacent_boundaries_allowed(config: &Config, epoch: u64, digest: &str) -> boo
         })
 }
 
-fn retirement_allowed(config: &Config, epoch: u64, digest: &str) -> bool {
+fn retirement_allowed(config: &Config, epoch: u64, digest: &str, public_read: bool) -> bool {
     config.delete_local
+        && public_read
         && !config
             .defer_epochs
             .iter()
@@ -588,6 +693,43 @@ fn run_sync(config: &Config, epoch: u64, delete_local: bool) -> Result<()> {
     Ok(())
 }
 
+fn public_verify_command(config: &Config, epoch: u64) -> Command {
+    let mut command = Command::new(&config.uploader);
+    command
+        .arg("public-verify")
+        .arg(&config.horizon_directory)
+        .arg("--epochs")
+        .arg(format!("{epoch}-{epoch}"))
+        .arg("--public-receipt-directory")
+        .arg(&config.public_receipt_directory);
+    command
+}
+
+fn run_public_verify(config: &Config, epoch: u64) -> Result<bool> {
+    println!("epoch {epoch}: anonymous public verification started");
+    let status = public_verify_command(config, epoch)
+        .status()
+        .with_context(|| format!("failed to start public verifier for epoch {epoch}"))?;
+    if !status.success() {
+        let receipt_path = config
+            .public_receipt_directory
+            .join(format!("epoch-{epoch}.public.json"));
+        if archive_metadata(&receipt_path)?.is_some() {
+            bail!(
+                "public verification failed for epoch {epoch} with an existing public-read receipt: {}",
+                status_text(status)
+            );
+        }
+        println!(
+            "epoch {epoch}: waiting for anonymous public access ({})",
+            status_text(status)
+        );
+        return Ok(false);
+    }
+    println!("epoch {epoch}: anonymous public verification complete");
+    Ok(true)
+}
+
 fn status_text(status: ExitStatus) -> String {
     status
         .code()
@@ -605,30 +747,53 @@ fn run(config: &Config) -> Result<()> {
             let receipt_path = config
                 .receipt_directory
                 .join(format!("epoch-{epoch}.r2.json"));
-            let Some(pair) = pair else {
-                if archive_metadata(&receipt_path)?.is_none() {
+            let r2_evidence = if let Some(pair) = &pair {
+                if !receipt_matches(&receipt_path, epoch, &pair.digest, pair) {
+                    if !publication_allowed(config, epoch, &pair.digest) {
+                        incomplete += 1;
+                        println!("epoch {epoch}: waiting for exact full and plugin receipts");
+                        continue;
+                    }
+                    run_sync(config, epoch, false)?;
+                }
+                let evidence = r2_receipt_evidence(&receipt_path, epoch).ok_or_else(|| {
+                    anyhow!("epoch {epoch}: uploader did not write a valid R2 receipt")
+                })?;
+                ensure!(
+                    evidence.digest == pair.digest
+                        && evidence.archive_length == pair.archive_length,
+                    "epoch {epoch}: authenticated R2 receipt differs from the local pair"
+                );
+                evidence
+            } else {
+                let Some(evidence) = r2_receipt_evidence(&receipt_path, epoch) else {
                     incomplete += 1;
-                }
-                continue;
+                    continue;
+                };
+                evidence
             };
-            let publish = publication_allowed(config, epoch, &pair.digest);
-            let retire = retirement_allowed(config, epoch, &pair.digest);
-            if receipt_matches(&receipt_path, epoch, &pair.digest, &pair) {
-                if retire {
-                    run_sync(config, epoch, true)?;
-                }
-                continue;
-            }
-            if !publish {
+
+            if !run_public_verify(config, epoch)? {
                 incomplete += 1;
-                println!("epoch {epoch}: waiting for exact full and plugin receipts");
                 continue;
             }
-            run_sync(config, epoch, retire)?;
+            let public_receipt_path = config
+                .public_receipt_directory
+                .join(format!("epoch-{epoch}.public.json"));
+            ensure!(
+                public_receipt_matches(&public_receipt_path, epoch, &r2_evidence),
+                "epoch {epoch}: public-read receipt does not match the authenticated R2 receipt"
+            );
+
+            if let Some(pair) = &pair
+                && retirement_allowed(config, epoch, &pair.digest, true)
+            {
+                run_sync(config, epoch, true)?;
+            }
         }
         if incomplete == 0 {
             println!(
-                "epochs {}-{}: every epoch has an R2 receipt",
+                "epochs {}-{}: every epoch is anonymously readable with matching R2 evidence",
                 config.first_epoch, config.last_epoch
             );
             return Ok(());
@@ -659,7 +824,14 @@ mod tests {
     }
 
     fn test_config(root: &Path) -> Config {
-        for name in ["horizon", "receipts", "full", "plugin", "boundary"] {
+        for name in [
+            "horizon",
+            "receipts",
+            "public-receipts",
+            "full",
+            "plugin",
+            "boundary",
+        ] {
             fs::create_dir(root.join(name)).unwrap();
         }
         let uploader = root.join("uploader");
@@ -670,6 +842,7 @@ mod tests {
             uploader,
             horizon_directory: root.join("horizon"),
             receipt_directory: root.join("receipts"),
+            public_receipt_directory: root.join("public-receipts"),
             first_epoch: 7,
             last_epoch: 7,
             poll_seconds: 1,
@@ -731,11 +904,13 @@ mod tests {
         let pair = local_pair(temporary.path(), 7).unwrap().unwrap();
         let receipt = serde_json::json!({
             "schema": "jetstreamer-horizon-r2-receipt-v1",
+            "bucket": "bucket",
             "epoch": 7,
             "archive_key": "epoch-7.jet",
             "checksum_key": "epoch-7.jet.sha256",
             "archive_sha256": checksum,
             "archive_length": pair.archive_length,
+            "archive_etag": "etag",
             "verified_unix_seconds":
                 (pair.archive_modified_nanoseconds.max(0) / 1_000_000_000) as u64 + 1,
             "remote_sha256_readback": true,
@@ -793,12 +968,13 @@ mod tests {
         )
         .unwrap();
         assert!(publication_allowed(&config, 7, &checksum));
-        assert!(retirement_allowed(&config, 7, &checksum));
+        assert!(!retirement_allowed(&config, 7, &checksum, false));
+        assert!(retirement_allowed(&config, 7, &checksum, true));
         fs::remove_file(config.boundary.directory.join("boundary-7-8.ok")).unwrap();
         assert!(publication_allowed(&config, 7, &checksum));
-        assert!(!retirement_allowed(&config, 7, &checksum));
+        assert!(!retirement_allowed(&config, 7, &checksum, true));
         config.defer_epochs.push((7, 9));
-        assert!(!retirement_allowed(&config, 7, &checksum));
+        assert!(!retirement_allowed(&config, 7, &checksum, true));
     }
 
     #[test]
@@ -812,6 +988,53 @@ mod tests {
             .collect();
         assert!(arguments.contains(&"--delete-local".to_owned()));
         assert_eq!(command.get_program(), config.uploader.as_os_str());
+    }
+
+    #[test]
+    fn public_verification_is_delegated_to_rust_uploader() {
+        let temporary = TempDir::new().unwrap();
+        let config = test_config(temporary.path());
+        let command = public_verify_command(&config, 7);
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(arguments[0], "public-verify");
+        assert!(arguments.contains(&"--public-receipt-directory".to_owned()));
+        assert_eq!(command.get_program(), config.uploader.as_os_str());
+    }
+
+    #[test]
+    fn public_receipt_must_match_authenticated_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let checksum = digest("a");
+        let receipt = serde_json::json!({
+            "schema": "jetstreamer-horizon-r2-public-read-receipt-v1",
+            "bucket": "bucket",
+            "epoch": 7,
+            "archive_key": "epoch-7.jet",
+            "checksum_key": "epoch-7.jet.sha256",
+            "public_base_url": "https://archive.example.com/",
+            "public_archive_url": "https://archive.example.com/epoch-7.jet",
+            "public_checksum_url": "https://archive.example.com/epoch-7.jet.sha256",
+            "archive_length": 123,
+            "archive_etag": "etag",
+            "archive_sha256": checksum,
+            "verified_unix_seconds": 1,
+        });
+        let path = temporary.path().join("epoch-7.public.json");
+        fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let evidence = R2ReceiptEvidence {
+            bucket: "bucket".to_owned(),
+            digest: checksum,
+            archive_length: 123,
+            archive_etag: "etag".to_owned(),
+        };
+        assert!(public_receipt_matches(&path, 7, &evidence));
+        let mut wrong_length = evidence.clone();
+        wrong_length.archive_length = 124;
+        assert!(!public_receipt_matches(&path, 7, &wrong_length));
+        assert!(!public_receipt_matches(&path, 8, &evidence));
     }
 
     #[test]

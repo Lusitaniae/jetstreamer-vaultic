@@ -19,6 +19,11 @@ use {
     aws_types::region::Region,
     base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD},
     md5::Md5,
+    reqwest::{
+        Client as HttpClient, StatusCode,
+        header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, RANGE},
+        redirect::Policy as RedirectPolicy,
+    },
     serde::{Deserialize, Serialize},
     sha2::{Digest as _, Sha256},
     std::{
@@ -28,7 +33,7 @@ use {
         io::{Read, Seek, SeekFrom, Write},
         os::unix::{fs::MetadataExt as _, fs::OpenOptionsExt as _},
         path::{Path, PathBuf},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
     url::Url,
 };
@@ -42,6 +47,7 @@ const MAX_REMOTE_READ_RANGE_SIZE: u64 = 64 * 1024 * 1024;
 const MIN_REMOTE_READ_RANGE_SIZE: u64 = 8 * 1024 * 1024;
 const REMOTE_READ_BUFFER_BUDGET: u64 = 512 * 1024 * 1024;
 const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-receipt-v1";
+const PUBLIC_RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-public-read-receipt-v1";
 
 #[derive(Debug)]
 struct Config {
@@ -49,6 +55,7 @@ struct Config {
     directory: PathBuf,
     epochs: BTreeSet<u64>,
     receipt_directory: Option<PathBuf>,
+    public_receipt_directory: Option<PathBuf>,
     delete_local: bool,
     part_size: u64,
     legacy_part_size: Option<u64>,
@@ -61,6 +68,7 @@ struct Config {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Command {
     Inventory,
+    PublicVerify,
     RetireLocal,
     Sync,
     Verify,
@@ -73,6 +81,11 @@ struct R2Config {
     bucket: String,
     access_key: String,
     secret_key: String,
+}
+
+#[derive(Clone, Debug)]
+struct PublicConfig {
+    base_url: Url,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,10 +133,26 @@ struct Receipt {
     verified_unix_seconds: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PublicReceipt {
+    schema: String,
+    bucket: String,
+    epoch: u64,
+    archive_key: String,
+    checksum_key: String,
+    public_base_url: String,
+    public_archive_url: String,
+    public_checksum_url: String,
+    archive_length: u64,
+    archive_etag: String,
+    archive_sha256: String,
+    verified_unix_seconds: u64,
+}
+
 fn usage() -> ! {
     eprintln!(concat!(
-        "usage: horizon-r2 <inventory|retire-local|sync|verify|restore> DIRECTORY [--epochs START-END] ",
-        "[--receipt-directory DIRECTORY] [--delete-local] [--part-size-mib N] ",
+        "usage: horizon-r2 <inventory|public-verify|retire-local|sync|verify|restore> DIRECTORY [--epochs START-END] ",
+        "[--receipt-directory DIRECTORY] [--public-receipt-directory DIRECTORY] [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
         "[--repair-orphaned-archive] ",
         "[--concurrency N]"
@@ -139,6 +168,7 @@ fn parse_args() -> Result<Config> {
         .as_deref()
     {
         Some("inventory") => Command::Inventory,
+        Some("public-verify") => Command::PublicVerify,
         Some("retire-local") => Command::RetireLocal,
         Some("sync") => Command::Sync,
         Some("verify") => Command::Verify,
@@ -148,6 +178,7 @@ fn parse_args() -> Result<Config> {
     let directory = args.next().map(PathBuf::from).unwrap_or_else(|| usage());
     let mut epochs = None;
     let mut receipt_directory = None;
+    let mut public_receipt_directory = None;
     let mut delete_local = false;
     let mut part_size = DEFAULT_PART_SIZE;
     let mut legacy_part_size = None;
@@ -168,6 +199,9 @@ fn parse_args() -> Result<Config> {
         match argument.as_str() {
             "--epochs" => epochs = Some(parse_epoch_range(&value()?)?),
             "--receipt-directory" => receipt_directory = Some(PathBuf::from(value()?)),
+            "--public-receipt-directory" => {
+                public_receipt_directory = Some(PathBuf::from(value()?))
+            }
             "--delete-local" => delete_local = true,
             "--part-size-mib" => part_size = parse_mib(&value()?)?,
             "--legacy-part-size-mib" => legacy_part_size = Some(parse_mib(&value()?)?),
@@ -188,7 +222,7 @@ fn parse_args() -> Result<Config> {
         directory.is_absolute(),
         "archive directory must be absolute"
     );
-    if command != Command::Inventory {
+    if !matches!(command, Command::Inventory | Command::PublicVerify) {
         ensure!(
             receipt_directory.is_some(),
             "--receipt-directory is required"
@@ -200,6 +234,22 @@ fn parse_args() -> Result<Config> {
             "receipt directory must be absolute"
         );
     }
+    if command == Command::PublicVerify {
+        ensure!(
+            public_receipt_directory.is_some(),
+            "--public-receipt-directory is required"
+        );
+    }
+    if let Some(public_receipt_directory) = &public_receipt_directory {
+        ensure!(
+            public_receipt_directory.is_absolute(),
+            "public receipt directory must be absolute"
+        );
+    }
+    ensure!(
+        public_receipt_directory.is_none() || command == Command::PublicVerify,
+        "--public-receipt-directory is valid only with public-verify"
+    );
     ensure!(
         !delete_local || command == Command::Sync,
         "--delete-local is valid only with sync"
@@ -222,6 +272,7 @@ fn parse_args() -> Result<Config> {
     );
     let epochs = match (command, epochs) {
         (Command::Inventory, None) => bail!("inventory requires --epochs START-END"),
+        (Command::PublicVerify, None) => bail!("public-verify requires --epochs START-END"),
         (Command::RetireLocal, None) => bail!("retire-local requires --epochs START-END"),
         (Command::Restore, None) => bail!("restore requires --epochs START-END"),
         (_, Some(epochs)) => epochs,
@@ -233,6 +284,7 @@ fn parse_args() -> Result<Config> {
         directory,
         epochs,
         receipt_directory,
+        public_receipt_directory,
         delete_local,
         part_size,
         legacy_part_size,
@@ -319,6 +371,55 @@ fn r2_config_from_env() -> Result<R2Config> {
         secret_key: env::var("HORIZON_SECRET_ACCESS_KEY")
             .context("HORIZON_SECRET_ACCESS_KEY is unset")?,
     })
+}
+
+fn parse_public_config(raw: &str) -> Result<PublicConfig> {
+    let mut base_url = Url::parse(raw).context("invalid HORIZON_PUBLIC_BASE_URL")?;
+    ensure!(
+        base_url.scheme() == "https",
+        "public R2 origin must use HTTPS"
+    );
+    ensure!(
+        base_url.username().is_empty() && base_url.password().is_none(),
+        "public R2 origin must not contain credentials"
+    );
+    ensure!(
+        base_url.query().is_none() && base_url.fragment().is_none(),
+        "public R2 origin has query/fragment"
+    );
+    ensure!(
+        base_url.port().is_none() || base_url.port() == Some(443),
+        "public R2 origin must use the standard HTTPS port"
+    );
+    let host = base_url
+        .host_str()
+        .ok_or_else(|| anyhow!("public R2 origin has no host"))?;
+    ensure!(
+        !host.ends_with(".r2.cloudflarestorage.com"),
+        "the authenticated R2 S3 API endpoint cannot be used as a public origin"
+    );
+    ensure!(
+        matches!(base_url.path(), "" | "/"),
+        "public R2 origin must name the bucket root"
+    );
+    base_url.set_path("/");
+    Ok(PublicConfig { base_url })
+}
+
+fn public_config_from_env() -> Result<PublicConfig> {
+    let raw = env::var("HORIZON_PUBLIC_BASE_URL").context("HORIZON_PUBLIC_BASE_URL is unset")?;
+    parse_public_config(&raw)
+}
+
+fn public_object_url(public: &PublicConfig, key: &str) -> Result<Url> {
+    ensure!(
+        !key.is_empty() && !key.contains('/') && !key.contains('?') && !key.contains('#'),
+        "invalid public object key"
+    );
+    public
+        .base_url
+        .join(key)
+        .context("failed to construct public object URL")
 }
 
 fn s3_client(config: &R2Config) -> Client {
@@ -621,6 +722,154 @@ fn inventory_report(entries: Vec<InventoryEntry>) -> InventoryReport {
         anomalies,
         entries,
     }
+}
+
+fn parse_public_content_range(value: &str) -> Result<u64> {
+    let total = value
+        .strip_prefix("bytes 0-0/")
+        .ok_or_else(|| anyhow!("public archive returned an unexpected Content-Range"))?;
+    let total = total
+        .parse::<u64>()
+        .context("public archive Content-Range has an invalid length")?;
+    ensure!(total > 0, "public archive is empty");
+    Ok(total)
+}
+
+async fn verify_public_pair(
+    http: &HttpClient,
+    public: &PublicConfig,
+    bucket: &str,
+    epoch: u64,
+    archive: &RemoteArchive,
+    sidecar: &[u8],
+) -> Result<PublicReceipt> {
+    let archive_key = format!("epoch-{epoch}.jet");
+    let checksum_key = format!("epoch-{epoch}.jet.sha256");
+    let archive_url = public_object_url(public, &archive_key)?;
+    let checksum_url = public_object_url(public, &checksum_key)?;
+
+    let archive_response = http
+        .get(archive_url.clone())
+        .header(RANGE, "bytes=0-0")
+        .send()
+        .await
+        .context("anonymous public archive GET failed")?;
+    ensure!(
+        archive_response.status() == StatusCode::PARTIAL_CONTENT,
+        "anonymous public archive GET returned HTTP {}",
+        archive_response.status()
+    );
+    let public_archive_length = parse_public_content_range(
+        archive_response
+            .headers()
+            .get(CONTENT_RANGE)
+            .ok_or_else(|| anyhow!("public archive response has no Content-Range"))?
+            .to_str()
+            .context("public archive Content-Range is not ASCII")?,
+    )?;
+    ensure!(
+        public_archive_length == archive.length,
+        "public archive length differs from authenticated R2"
+    );
+    let public_archive_etag = normalize_etag(
+        archive_response
+            .headers()
+            .get(ETAG)
+            .ok_or_else(|| anyhow!("public archive response has no ETag"))?
+            .to_str()
+            .context("public archive ETag is not ASCII")?,
+    );
+    ensure!(
+        public_archive_etag == archive.etag,
+        "public archive ETag differs from authenticated R2"
+    );
+    ensure!(
+        archive_response
+            .headers()
+            .get(CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            == Some("1"),
+        "public archive range response does not contain exactly one byte"
+    );
+    ensure!(
+        archive_response.bytes().await?.len() == 1,
+        "public archive range body does not contain exactly one byte"
+    );
+
+    let checksum_response = http
+        .get(checksum_url.clone())
+        .send()
+        .await
+        .context("anonymous public sidecar GET failed")?;
+    ensure!(
+        checksum_response.status() == StatusCode::OK,
+        "anonymous public sidecar GET returned HTTP {}",
+        checksum_response.status()
+    );
+    let public_sidecar_length = checksum_response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .ok_or_else(|| anyhow!("public sidecar response has no Content-Length"))?
+        .to_str()
+        .context("public sidecar Content-Length is not ASCII")?
+        .parse::<u64>()
+        .context("public sidecar Content-Length is invalid")?;
+    ensure!(
+        public_sidecar_length <= MAX_SIDECAR_BYTES,
+        "public sidecar is oversized"
+    );
+    let public_sidecar = checksum_response.bytes().await?;
+    ensure!(
+        public_sidecar.len() == usize::try_from(public_sidecar_length)?,
+        "public sidecar body length differs from Content-Length"
+    );
+    ensure!(
+        public_sidecar.as_ref() == sidecar,
+        "public sidecar differs from authenticated R2"
+    );
+    let archive_sha256 = parse_canonical_sidecar(epoch, sidecar)
+        .ok_or_else(|| anyhow!("authenticated R2 sidecar is not canonical"))?;
+    if let Some(metadata_sha256) = &archive.metadata_sha256 {
+        ensure!(
+            metadata_sha256 == &archive_sha256,
+            "authenticated R2 archive metadata differs from its sidecar"
+        );
+    }
+
+    Ok(PublicReceipt {
+        schema: PUBLIC_RECEIPT_SCHEMA.to_owned(),
+        bucket: bucket.to_owned(),
+        epoch,
+        archive_key,
+        checksum_key,
+        public_base_url: public.base_url.as_str().to_owned(),
+        public_archive_url: archive_url.as_str().to_owned(),
+        public_checksum_url: checksum_url.as_str().to_owned(),
+        archive_length: archive.length,
+        archive_etag: archive.etag.clone(),
+        archive_sha256,
+        verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    })
+}
+
+async fn public_verify_epoch(
+    s3: &Client,
+    http: &HttpClient,
+    r2: &R2Config,
+    public: &PublicConfig,
+    receipt_directory: &Path,
+    epoch: u64,
+) -> Result<PathBuf> {
+    let archive_key = format!("epoch-{epoch}.jet");
+    let checksum_key = format!("epoch-{epoch}.jet.sha256");
+    let archive = head_archive(s3, &r2.bucket, &archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("authenticated R2 archive is missing"))?;
+    let sidecar = remote_sidecar(s3, &r2.bucket, &checksum_key)
+        .await?
+        .ok_or_else(|| anyhow!("authenticated R2 sidecar is missing"))?;
+    let receipt = verify_public_pair(http, public, &r2.bucket, epoch, &archive, &sidecar).await?;
+    write_public_receipt(receipt_directory, &receipt)
 }
 
 async fn head_archive(client: &Client, bucket: &str, key: &str) -> Result<Option<RemoteArchive>> {
@@ -938,6 +1187,64 @@ fn same_receipt_evidence(left: &Receipt, right: &Receipt) -> bool {
         && left.r2_composite_sha256 == right.r2_composite_sha256
         && left.remote_sha256_readback == right.remote_sha256_readback
         && left.multipart_part_size == right.multipart_part_size
+}
+
+fn public_receipt_path(directory: &Path, epoch: u64) -> PathBuf {
+    directory.join(format!("epoch-{epoch}.public.json"))
+}
+
+fn same_public_receipt_evidence(left: &PublicReceipt, right: &PublicReceipt) -> bool {
+    left.schema == right.schema
+        && left.bucket == right.bucket
+        && left.epoch == right.epoch
+        && left.archive_key == right.archive_key
+        && left.checksum_key == right.checksum_key
+        && left.public_base_url == right.public_base_url
+        && left.public_archive_url == right.public_archive_url
+        && left.public_checksum_url == right.public_checksum_url
+        && left.archive_length == right.archive_length
+        && left.archive_etag == right.archive_etag
+        && left.archive_sha256 == right.archive_sha256
+}
+
+fn write_public_receipt(directory: &Path, receipt: &PublicReceipt) -> Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    fs::set_permissions(
+        directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    let final_path = public_receipt_path(directory, receipt.epoch);
+    if final_path.exists() {
+        let before = regular_identity(&final_path)?;
+        ensure!(before.length <= 16 * 1024, "oversized public-read receipt");
+        let existing: PublicReceipt = serde_json::from_slice(&fs::read(&final_path)?)?;
+        ensure!(
+            regular_identity(&final_path)? == before,
+            "public-read receipt changed while read"
+        );
+        ensure!(
+            same_public_receipt_evidence(&existing, receipt),
+            "existing public-read receipt differs for epoch {}",
+            receipt.epoch
+        );
+        return Ok(final_path);
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".epoch-{}.public.", receipt.epoch))
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), receipt)?;
+    temporary.as_file_mut().write_all(b"\n")?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist_noclobber(&final_path).map_err(|error| {
+        anyhow!(
+            "failed to publish {}: {}",
+            final_path.display(),
+            error.error
+        )
+    })?;
+    File::open(directory)?.sync_all()?;
+    Ok(final_path)
 }
 
 fn read_restore_receipt(directory: &Path, bucket: &str, epoch: u64) -> Result<Receipt> {
@@ -1711,6 +2018,30 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if config.command == Command::PublicVerify {
+        let public = public_config_from_env()?;
+        let http = HttpClient::builder()
+            .no_proxy()
+            .redirect(RedirectPolicy::none())
+            .timeout(Duration::from_secs(60))
+            .build()
+            .context("failed to construct anonymous public-read client")?;
+        let receipt_directory = config
+            .public_receipt_directory
+            .as_deref()
+            .expect("public-verify requires a public receipt directory");
+        for &epoch in &config.epochs {
+            let receipt_path =
+                public_verify_epoch(&client, &http, &r2, &public, receipt_directory, epoch)
+                    .await
+                    .with_context(|| format!("epoch {epoch} public verification failed"))?;
+            eprintln!(
+                "epoch {epoch}: anonymously readable, receipt {}",
+                receipt_path.display()
+            );
+        }
+        return Ok(());
+    }
     for &epoch in &config.epochs {
         match config.command {
             Command::RetireLocal => retire_verified_local_epoch(&client, &r2, &config, epoch)
@@ -1722,7 +2053,9 @@ async fn main() -> Result<()> {
             Command::Sync | Command::Verify => sync_epoch(&client, &r2, &config, epoch)
                 .await
                 .with_context(|| format!("epoch {epoch} R2 delivery failed"))?,
-            Command::Inventory => unreachable!("inventory handled above"),
+            Command::Inventory | Command::PublicVerify => {
+                unreachable!("read-only command handled above")
+            }
         }
     }
     Ok(())
@@ -1738,6 +2071,82 @@ mod tests {
         assert!(parse_epoch_range("9-7").is_err());
         assert_eq!(parse_mib("64").unwrap(), 64 * 1024 * 1024);
         assert!(parse_mib("4").is_err());
+    }
+
+    #[test]
+    fn public_origin_is_distinct_from_the_authenticated_s3_api() {
+        let managed = parse_public_config("https://pub-0123456789abcdef.r2.dev").unwrap();
+        assert_eq!(
+            managed.base_url.as_str(),
+            "https://pub-0123456789abcdef.r2.dev/"
+        );
+        let custom = parse_public_config("https://archive.example.com/").unwrap();
+        assert_eq!(
+            public_object_url(&custom, "epoch-7.jet").unwrap().as_str(),
+            "https://archive.example.com/epoch-7.jet"
+        );
+        assert!(
+            parse_public_config(
+                "https://995827f79dbd061b8d4fd07b4ca04414.r2.cloudflarestorage.com/solana-archive-with-accounts-data"
+            )
+            .is_err()
+        );
+        for invalid in [
+            "http://archive.example.com/",
+            "https://user@archive.example.com/",
+            "https://archive.example.com/prefix/",
+            "https://archive.example.com/?signature=secret",
+        ] {
+            assert!(parse_public_config(invalid).is_err(), "accepted {invalid}");
+        }
+    }
+
+    #[test]
+    fn public_archive_range_is_exact_and_nonempty() {
+        assert_eq!(parse_public_content_range("bytes 0-0/123").unwrap(), 123);
+        for invalid in ["bytes 0-1/123", "bytes 0-0/0", "bytes */123", "invalid"] {
+            assert!(
+                parse_public_content_range(invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    fn public_receipt(epoch: u64) -> PublicReceipt {
+        PublicReceipt {
+            schema: PUBLIC_RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch,
+            archive_key: format!("epoch-{epoch}.jet"),
+            checksum_key: format!("epoch-{epoch}.jet.sha256"),
+            public_base_url: "https://archive.example.com/".to_owned(),
+            public_archive_url: format!("https://archive.example.com/epoch-{epoch}.jet"),
+            public_checksum_url: format!("https://archive.example.com/epoch-{epoch}.jet.sha256"),
+            archive_length: 123,
+            archive_etag: "etag".to_owned(),
+            archive_sha256: "ab".repeat(32),
+            verified_unix_seconds: 1,
+        }
+    }
+
+    #[test]
+    fn public_receipt_is_no_clobber_and_time_is_not_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = public_receipt(7);
+        write_public_receipt(directory.path(), &receipt).unwrap();
+
+        let mut later = receipt.clone();
+        later.verified_unix_seconds = 2;
+        write_public_receipt(directory.path(), &later).unwrap();
+
+        let mut mismatch = later;
+        mismatch.archive_etag = "different".to_owned();
+        assert!(write_public_receipt(directory.path(), &mismatch).is_err());
+        let stored: PublicReceipt = serde_json::from_slice(
+            &fs::read(public_receipt_path(directory.path(), receipt.epoch)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored, receipt);
     }
 
     #[test]

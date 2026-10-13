@@ -205,6 +205,22 @@ local source before upload.
 from `HORIZON_ACCESS_KEY_ID` and `HORIZON_SECRET_ACCESS_KEY`. Credential values are never written to
 receipts or logs.
 
+The authenticated S3 endpoint is not a public object origin, and R2 does not support S3 object
+ACLs such as `public-read`. Public delivery uses the bucket's separately enabled `r2.dev` hostname
+or custom domain in `HORIZON_PUBLIC_BASE_URL`. `jetstreamer-r2 public-verify` sends anonymous range
+and sidecar GETs through that origin, checks the public archive length and ETag against authenticated
+R2, checks the public sidecar byte-for-byte, and fsyncs a no-clobber public-read receipt. It rejects
+`*.r2.cloudflarestorage.com`, credentials, signed queries, redirects, and non-root URL paths:
+
+```bash
+jetstreamer-r2 public-verify /absolute/horizon/directory \
+  --epochs 201-300 \
+  --public-receipt-directory /absolute/private/public-r2-receipts
+```
+
+This command never mutates R2. A `ready-pair` is storage-complete but is not publicly delivered
+until this anonymous proof succeeds for both objects.
+
 R2's S3 `UploadPart` currently rejects `x-amz-checksum-sha256` even though the R2 compatibility
 matrix advertises composite SHA-256. The uploader therefore sends R2-validated `Content-MD5` for
 every part, reconstructs and checks the final multipart ETag, and reads the completed archive back
@@ -265,12 +281,16 @@ jetstreamer-r2 retire-local /absolute/horizon/directory \
   --receipt-directory /absolute/private/r2-receipts
 ```
 
-`jetstreamer-r2-progressive` permits R2 publication after the full and current-plugin receipts
-agree with the archive. Local retirement remains stricter and additionally requires both
-adjacent-boundary receipts. This allows disjoint producers to exchange a verified boundary neighbor
-through R2 without creating a circular upload dependency. Use the Rust coordinator for new
-deployments. The legacy `scripts/sync_horizon_r2_progressive.py` coordinator is retained only for
-already-sealed workflows whose evidence would be invalidated by an in-place implementation change.
+`jetstreamer-r2-progressive` permits authenticated R2 storage after the full and current-plugin
+receipts agree with the archive. It then invokes the same Rust `public-verify` command and requires
+`--public-receipt-directory`; only a successful fresh anonymous check makes the pair publication
+complete. A pending public origin does not block authenticated uploads for other eligible epochs.
+Local retirement remains stricter and additionally requires the matching public-read receipt and
+both adjacent-boundary receipts. This allows disjoint producers to exchange a verified boundary
+neighbor through R2 without creating a circular upload dependency. Use the Rust coordinator for
+new deployments. The legacy `scripts/sync_horizon_r2_progressive.py` coordinator is retained only
+for already-sealed workflows whose evidence would be invalidated by an in-place implementation
+change.
 
 When a user has explicitly authorized local retirement at a filesystem floor,
 `scripts/retire_horizon_at_reserve.py` is the bounded emergency policy wrapper. Configure the
@@ -320,9 +340,11 @@ generation, verification, delivery, and cleanup.
 
 For an actively generated range, `jetstreamer-r2-progressive` watches for complete archive/sidecar
 pairs and invokes `jetstreamer-r2` serially. It checks whether an existing private receipt still
-describes the current local archive identity before skipping it. Local retirement additionally
-requires receipts from the exact approved full verifier/script, plugin binary/script, and boundary
-verifier/script plus both adjacent archive boundaries. Use `--local-mutation-lock` when a reserve
+describes the current local archive identity before skipping authenticated sync. It requires
+`--public-receipt-directory` and delegates a fresh anonymous public check to `jetstreamer-r2` for
+every storage-complete pair. Local retirement additionally requires that matching public-read
+receipt, receipts from the exact approved full verifier/script, plugin binary/script, and boundary
+verifier/script, plus both adjacent archive boundaries. Use `--local-mutation-lock` when a reserve
 retirement wrapper is installed so upload and local retirement cannot inspect or mutate the same
 pair concurrently. The coordinator never deletes remote data; all R2 operations and optional local
 retirement remain delegated to `jetstreamer-r2`.
