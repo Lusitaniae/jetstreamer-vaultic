@@ -891,6 +891,11 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 - Refuse to begin upload without exact full and current-plugin receipts. Refuse local retirement without both adjacent-boundary receipts as well.
 - Do not treat a sidecar alone as proof that the archive was uploaded.
 - Resume idempotently from R2 inventory and private receipts after interruption.
-- Leave at least 30 minutes between routine status checks for each running job or
-  cohort. Diagnose an observed failure immediately instead of waiting for the next
-  interval.
+- Leave at least 30 minutes between routine status checks for each running job,
+  cohort, or durable watcher. After arming a persistent timer or watcher, do not poll
+  it in short empty loops or emit repeated no-change status turns; let it run
+  unattended and inspect it once the cadence interval has elapsed or its scheduled
+  event should have completed. This cadence conserves operator/model tokens as well
+  as host and API work. Diagnose an observed failure or answer an explicit operator
+  status request immediately, but do not use either as a reason to restart or
+  duplicate healthy work.
