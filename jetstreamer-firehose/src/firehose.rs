@@ -1319,6 +1319,7 @@ pub struct RewardsData {
 
 /// Block-level data streamed to block handlers.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum BlockData {
     /// Fully populated block payload with ledger metadata.
     Block {
@@ -1344,6 +1345,12 @@ pub enum BlockData {
         executed_transaction_count: u64,
         /// Number of entries contained in the block.
         entry_count: u64,
+        /// Raw Alpenglow block markers in block order. `None` before Alpenglow.
+        /// The byte layout is on [`crate::block::SlotMeta::block_markers`].
+        block_markers: Option<Vec<Vec<u8>>>,
+        /// Alpenglow block id, the double merkle root that certificates vote on.
+        /// `None` before Alpenglow.
+        block_id: Option<Hash>,
     },
     /// Marker indicating the slot appears skipped (either truly skipped or it is late and will
     /// arrive out of order).
@@ -2457,6 +2464,14 @@ where
                                                         executed_transaction_count:
                                                             this_block_executed_transaction_count,
                                                         entry_count: this_block_entry_count,
+                                                        block_markers: block
+                                                            .meta
+                                                            .block_markers
+                                                            .clone(),
+                                                        block_id: block
+                                                            .meta
+                                                            .block_id
+                                                            .map(Hash::from),
                                                     },
                                                 )
                                                 .await

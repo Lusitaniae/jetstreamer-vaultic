@@ -1,5 +1,6 @@
 use {
     crate::{SharedError, node::Kind, node_reader::cid_from_cbor_link},
+    base64::engine::{Engine, general_purpose::STANDARD},
     cid::Cid,
     std::vec::Vec,
 };
@@ -51,6 +52,8 @@ impl Block {
                 parent_slot: 0,
                 blocktime: 0,
                 block_height: None,
+                block_markers: None,
+                block_id: None,
             },
             rewards: Cid::try_from(
                 vec![
@@ -200,6 +203,8 @@ mod block_tests {
                 parent_slot: 1,
                 blocktime: 1,
                 block_height: Some(1),
+                block_markers: None,
+                block_id: None,
             },
             rewards: Cid::try_from(
                 vec![
@@ -1205,9 +1210,11 @@ mod shredding_tests {
 }
 
 // type SlotMeta struct {
-// 	Parent_slot  int
-// 	Blocktime    int
-// 	Block_height **int
+// 	Parent_slot   int
+// 	Blocktime     int
+// 	Block_height  **int
+// 	Block_markers **[][]byte
+// 	Block_id      **[]byte
 // }
 /// Slot-level metadata associated with a block.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -1218,6 +1225,13 @@ pub struct SlotMeta {
     pub blocktime: u64,
     /// Optional block height.
     pub block_height: Option<u64>,
+    /// Raw Alpenglow block markers (header, footer and others) in block order. Each is a
+    /// little-endian `u16 version | u8 variant | u16 len | payload`, which
+    /// `solana_entry::block_component::VersionedBlockMarker` decodes. `None` before Alpenglow.
+    pub block_markers: Option<Vec<Vec<u8>>>,
+    /// Alpenglow block id, the double merkle root that certificates vote on. `None` before
+    /// Alpenglow.
+    pub block_id: Option<[u8; 32]>,
 }
 
 impl SlotMeta {
@@ -1227,6 +1241,8 @@ impl SlotMeta {
             parent_slot: 0,
             blocktime: 0,
             block_height: None,
+            block_markers: None,
+            block_id: None,
         };
 
         if let serde_cbor::Value::Array(array) = val {
@@ -1240,6 +1256,20 @@ impl SlotMeta {
             }
             if let Some(serde_cbor::Value::Integer(block_height)) = array.get(2) {
                 slot_meta.block_height = Some(*block_height as u64);
+            }
+            // Old Faithful fails the whole block on a malformed field. This stays lenient like the
+            // fields above.
+            if let Some(serde_cbor::Value::Array(markers)) = array.get(3) {
+                slot_meta.block_markers = markers
+                    .iter()
+                    .map(|marker| match marker {
+                        serde_cbor::Value::Bytes(bytes) => Some(bytes.clone()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            if let Some(serde_cbor::Value::Bytes(block_id)) = array.get(4) {
+                slot_meta.block_id = block_id.as_slice().try_into().ok();
             }
         }
         slot_meta
@@ -1264,6 +1294,19 @@ impl SlotMeta {
                 serde_json::Value::from(self.block_height),
             );
         }
+        if let Some(markers) = &self.block_markers {
+            let markers = markers.iter().map(|marker| STANDARD.encode(marker));
+            map.insert(
+                "block_markers".to_string(),
+                serde_json::Value::from_iter(markers),
+            );
+        }
+        if let Some(block_id) = &self.block_id {
+            map.insert(
+                "block_id".to_string(),
+                serde_json::Value::from(STANDARD.encode(block_id)),
+            );
+        }
 
         serde_json::Value::from(map)
     }
@@ -1272,6 +1315,15 @@ impl SlotMeta {
 #[cfg(test)]
 mod slot_meta_tests {
     use super::*;
+    use serde_cbor::Value::{Array, Bytes, Integer, Null};
+
+    // Marker vectors from yellowstone-faithful iplddecoders/block_markers_test.go.
+    const HEADER: [u8; 7] = [0x01, 0x00, 0x01, 0x02, 0x00, 0x01, 0xee];
+    const FOOTER: [u8; 8] = [0x01, 0x00, 0x00, 0x03, 0x00, 0xaa, 0xbb, 0xcc];
+
+    fn decode(fields: Vec<serde_cbor::Value>) -> SlotMeta {
+        SlotMeta::from_cbor(Array(fields))
+    }
 
     #[test]
     fn test_slot_meta() {
@@ -1279,6 +1331,8 @@ mod slot_meta_tests {
             parent_slot: 1,
             blocktime: 1,
             block_height: Some(1),
+            block_markers: None,
+            block_id: None,
         };
         let json = slot_meta.to_json();
 
@@ -1289,5 +1343,71 @@ mod slot_meta_tests {
         });
 
         assert_eq!(json, wanted_json);
+    }
+
+    #[test]
+    fn test_slot_meta_alpenglow_fields() {
+        let markers = Array(vec![Bytes(HEADER.to_vec()), Bytes(FOOTER.to_vec())]);
+        let block_id = Bytes(vec![0x42; 32]);
+
+        let pre_alpenglow = decode(vec![Integer(8), Integer(123), Integer(7)]);
+        assert_eq!(pre_alpenglow.block_markers, None);
+        assert_eq!(pre_alpenglow.block_id, None);
+
+        let alpenglow = decode(vec![
+            Integer(8),
+            Integer(123),
+            Integer(7),
+            markers,
+            block_id.clone(),
+        ]);
+        assert_eq!(alpenglow.block_height, Some(7));
+        assert_eq!(
+            alpenglow.block_markers,
+            Some(vec![HEADER.to_vec(), FOOTER.to_vec()])
+        );
+        assert_eq!(alpenglow.block_id, Some([0x42; 32]));
+
+        let id_only = decode(vec![Integer(8), Integer(123), Null, Null, block_id]);
+        assert_eq!(id_only.block_markers, None);
+        assert_eq!(id_only.block_id, Some([0x42; 32]));
+
+        let no_markers = decode(vec![Integer(8), Integer(123), Integer(7), Array(vec![])]);
+        assert_eq!(no_markers.block_markers, Some(vec![]));
+
+        // Shapes that Old Faithful rejects decode as absent.
+        let malformed = decode(vec![
+            Integer(8),
+            Integer(123),
+            Null,
+            Array(vec![Bytes(FOOTER.to_vec()), Integer(1)]),
+            Bytes(vec![1, 2, 3]),
+        ]);
+        assert_eq!(malformed.block_markers, None);
+        assert_eq!(malformed.block_id, None);
+        let bytes_as_markers = decode(vec![Integer(8), Integer(123), Null, Bytes(FOOTER.to_vec())]);
+        assert_eq!(bytes_as_markers.block_markers, None);
+    }
+
+    #[test]
+    fn test_slot_meta_alpenglow_json() {
+        let slot_meta = SlotMeta {
+            parent_slot: 8,
+            blocktime: 123,
+            block_height: Some(7),
+            block_markers: Some(vec![FOOTER.to_vec()]),
+            block_id: Some([0x42; 32]),
+        };
+
+        // Same case as the Old Faithful "json" test.
+        let wanted_json = serde_json::json!({
+            "parent_slot": 8,
+            "blocktime": 123,
+            "block_height": 7,
+            "block_markers": ["AQAAAwCqu8w="],
+            "block_id": "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI="
+        });
+
+        assert_eq!(slot_meta.to_json(), wanted_json);
     }
 }
