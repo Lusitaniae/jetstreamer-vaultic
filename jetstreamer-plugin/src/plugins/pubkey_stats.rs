@@ -343,6 +343,8 @@ mod tests {
             block_height: Some(slot),
             executed_transaction_count: 0,
             entry_count: 0,
+            block_markers: None,
+            block_id: None,
         }
     }
 
