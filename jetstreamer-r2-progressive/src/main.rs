@@ -149,6 +149,20 @@ fn next_utf8(args: &mut impl Iterator<Item = std::ffi::OsString>, option: &str) 
         .map_err(|_| anyhow!("value for {option} is not UTF-8"))
 }
 
+fn option_value(
+    args: &mut impl Iterator<Item = std::ffi::OsString>,
+    option: &str,
+    inline_value: Option<&str>,
+) -> Result<String> {
+    match inline_value {
+        Some(value) => {
+            ensure!(!value.is_empty(), "missing value for {option}");
+            Ok(value.to_owned())
+        }
+        None => next_utf8(args, option),
+    }
+}
+
 fn parse_positive(value: &str, option: &str) -> Result<u64> {
     let parsed = value.parse().with_context(|| format!("invalid {option}"))?;
     ensure!(parsed > 0, "{option} must be positive");
@@ -245,71 +259,107 @@ fn parse_args() -> Result<Config> {
         let argument = argument
             .into_string()
             .map_err(|_| anyhow!("argument is not UTF-8"))?;
-        match argument.as_str() {
+        let (option, inline_value) = argument
+            .split_once('=')
+            .map_or((argument.as_str(), None), |(option, value)| {
+                (option, Some(value))
+            });
+        match option {
             "--poll-seconds" => {
-                poll_seconds = parse_positive(&next_utf8(&mut args, &argument)?, &argument)?
+                poll_seconds =
+                    parse_positive(&option_value(&mut args, option, inline_value)?, option)?
             }
             "--concurrency" => {
-                concurrency = parse_positive(&next_utf8(&mut args, &argument)?, &argument)?
+                concurrency =
+                    parse_positive(&option_value(&mut args, option, inline_value)?, option)?
             }
             "--legacy-part-size-mib" => {
-                legacy_part_size_mib = parse_positive(&next_utf8(&mut args, &argument)?, &argument)?
+                legacy_part_size_mib =
+                    parse_positive(&option_value(&mut args, option, inline_value)?, option)?
             }
-            "--delete-local" => delete_local = true,
+            "--delete-local" => {
+                ensure!(
+                    inline_value.is_none(),
+                    "--delete-local does not take a value"
+                );
+                delete_local = true;
+            }
             "--local-mutation-lock" => {
-                local_mutation_lock = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
+                local_mutation_lock = Some(PathBuf::from(option_value(
+                    &mut args,
+                    option,
+                    inline_value,
+                )?))
             }
             "--public-receipt-directory" => {
-                public_receipt_directory = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
+                public_receipt_directory = Some(PathBuf::from(option_value(
+                    &mut args,
+                    option,
+                    inline_value,
+                )?))
             }
             "--full-receipt-directory" => {
-                full_directory = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
+                full_directory = Some(PathBuf::from(option_value(
+                    &mut args,
+                    option,
+                    inline_value,
+                )?))
             }
             "--full-verifier-sha256" => {
                 full_verifier = Some(parse_allowlist(
-                    &next_utf8(&mut args, &argument)?,
-                    &argument,
+                    &option_value(&mut args, option, inline_value)?,
+                    option,
                 )?)
             }
             "--full-verifier-script-sha256" => {
                 full_script = Some(parse_allowlist(
-                    &next_utf8(&mut args, &argument)?,
-                    &argument,
+                    &option_value(&mut args, option, inline_value)?,
+                    option,
                 )?)
             }
             "--plugin-receipt-directory" => {
-                plugin_directory = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
+                plugin_directory = Some(PathBuf::from(option_value(
+                    &mut args,
+                    option,
+                    inline_value,
+                )?))
             }
             "--plugin-pipeline-sha256" => {
                 plugin_verifier = Some(parse_allowlist(
-                    &next_utf8(&mut args, &argument)?,
-                    &argument,
+                    &option_value(&mut args, option, inline_value)?,
+                    option,
                 )?)
             }
             "--plugin-verifier-script-sha256" => {
                 plugin_script = Some(parse_allowlist(
-                    &next_utf8(&mut args, &argument)?,
-                    &argument,
+                    &option_value(&mut args, option, inline_value)?,
+                    option,
                 )?)
             }
             "--boundary-receipt-directory" => {
-                boundary_directory = Some(PathBuf::from(next_utf8(&mut args, &argument)?))
+                boundary_directory = Some(PathBuf::from(option_value(
+                    &mut args,
+                    option,
+                    inline_value,
+                )?))
             }
             "--boundary-verifier-sha256" => {
                 boundary_verifier = Some(parse_allowlist(
-                    &next_utf8(&mut args, &argument)?,
-                    &argument,
+                    &option_value(&mut args, option, inline_value)?,
+                    option,
                 )?)
             }
             "--boundary-verifier-script-sha256" => {
                 boundary_script = Some(parse_allowlist(
-                    &next_utf8(&mut args, &argument)?,
-                    &argument,
+                    &option_value(&mut args, option, inline_value)?,
+                    option,
                 )?)
             }
-            "--defer-epochs" => {
-                defer_epochs.push(parse_epoch_range(&next_utf8(&mut args, &argument)?)?)
-            }
+            "--defer-epochs" => defer_epochs.push(parse_epoch_range(&option_value(
+                &mut args,
+                option,
+                inline_value,
+            )?)?),
             _ => bail!("unknown argument: {argument}"),
         }
     }
@@ -813,6 +863,29 @@ mod tests {
 
     fn digest(byte: &str) -> String {
         byte.repeat(64)
+    }
+
+    #[test]
+    fn option_values_accept_inline_and_separate_forms() {
+        let mut no_arguments = Vec::<std::ffi::OsString>::new().into_iter();
+        assert_eq!(
+            option_value(&mut no_arguments, "--poll-seconds", Some("17")).unwrap(),
+            "17"
+        );
+
+        let mut one_argument = vec![std::ffi::OsString::from("23")].into_iter();
+        assert_eq!(
+            option_value(&mut one_argument, "--poll-seconds", None).unwrap(),
+            "23"
+        );
+
+        let mut no_arguments = Vec::<std::ffi::OsString>::new().into_iter();
+        assert!(
+            option_value(&mut no_arguments, "--poll-seconds", Some(""))
+                .unwrap_err()
+                .to_string()
+                .contains("missing value")
+        );
     }
 
     fn gate(path: &Path, verifier: &str, script: &str) -> Gate {
