@@ -286,14 +286,37 @@ fn parse_utc(value: &str) -> Result<u64> {
     Ok(unix)
 }
 
+fn parse_receipt_utc(value: &str) -> Result<u64> {
+    if value.len() > 20 && value.as_bytes().get(19) == Some(&b'.') && value.ends_with('Z') {
+        let fractional = &value[20..value.len() - 1];
+        ensure!(
+            !fractional.is_empty() && fractional.bytes().all(|byte| byte.is_ascii_digit()),
+            "fractional timestamp is invalid"
+        );
+        return parse_utc(&format!("{}Z", &value[..19]));
+    }
+    parse_utc(value)
+}
+
+fn receipt_timestamp(value: &Value) -> Result<&str> {
+    let recorded = value.get("recorded_at_utc").and_then(Value::as_str);
+    let observed = value.get("observed_at_utc").and_then(Value::as_str);
+    match (recorded, observed) {
+        (Some(recorded), None) => Ok(recorded),
+        (None, Some(observed)) => Ok(observed),
+        (Some(recorded), Some(observed)) if recorded == observed => Ok(recorded),
+        (Some(_), Some(_)) => Err(anyhow!("previous sample has conflicting timestamps")),
+        (None, None) => Err(anyhow!(
+            "previous sample lacks recorded_at_utc or observed_at_utc"
+        )),
+    }
+}
+
 fn previous_sample(path: &Path) -> Result<(Vec<u8>, String, u64)> {
     let bytes = read_bounded(path, MAX_PREVIOUS_SAMPLE_BYTES, "previous sample")?;
     let value: Value = serde_json::from_slice(&bytes).context("invalid previous sample JSON")?;
-    let timestamp = value
-        .get("recorded_at_utc")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("previous sample lacks recorded_at_utc"))?;
-    let unix = parse_utc(timestamp)?;
+    let timestamp = receipt_timestamp(&value)?;
+    let unix = parse_receipt_utc(timestamp)?;
     Ok((bytes, timestamp.to_owned(), unix))
 }
 
@@ -729,6 +752,25 @@ mod tests {
             assert_eq!(parse_utc(text).unwrap(), unix);
             assert_eq!(format_utc(unix).unwrap(), text);
         }
+    }
+
+    #[test]
+    fn predecessor_receipt_timestamp_compatibility() {
+        let recorded = serde_json::json!({"recorded_at_utc": "2026-10-14T14:18:11Z"});
+        assert_eq!(
+            parse_receipt_utc(receipt_timestamp(&recorded).unwrap()).unwrap(),
+            1_791_987_491
+        );
+        let observed = serde_json::json!({"observed_at_utc": "2026-10-14T14:18:11.818627220Z"});
+        assert_eq!(
+            parse_receipt_utc(receipt_timestamp(&observed).unwrap()).unwrap(),
+            1_791_987_491
+        );
+        let conflicting = serde_json::json!({
+            "recorded_at_utc": "2026-10-14T14:18:11Z",
+            "observed_at_utc": "2026-10-14T14:18:12Z"
+        });
+        assert!(receipt_timestamp(&conflicting).is_err());
     }
 
     #[test]
