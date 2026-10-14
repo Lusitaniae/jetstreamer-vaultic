@@ -125,6 +125,32 @@ fn assert_reward_commission_format(block: &BlockData) {
     );
 }
 
+// Real archives switch to markers once. Alternate so a value left from the last block fails.
+fn alpenglow_meta(slot: u64) -> Option<(Vec<u8>, [u8; 32])> {
+    slot.is_multiple_of(2).then(|| {
+        let tag = slot as u8;
+        (vec![1, 0, 0, 3, 0, tag, 0xbb, 0xcc], [tag; 32])
+    })
+}
+
+fn assert_alpenglow_meta(block: &BlockData) {
+    let BlockData::Block {
+        slot,
+        block_markers,
+        block_id,
+        ..
+    } = block
+    else {
+        return;
+    };
+    let (expected_markers, expected_id) = match alpenglow_meta(*slot) {
+        Some((footer, id)) => (Some(vec![footer]), Some(id)),
+        None => (None, None),
+    };
+    assert_eq!(*block_markers, expected_markers, "slot {slot}");
+    assert_eq!(block_id.map(|id| id.to_bytes()), expected_id, "slot {slot}");
+}
+
 fn archive() -> (Vec<u8>, Vec<u8>) {
     let mut nodes = Vec::new();
     let mut records = Vec::new();
@@ -164,6 +190,11 @@ fn archive() -> (Vec<u8>, Vec<u8>) {
                 Array(vec![Integer(5), Integer(slot.into()), frame(payload)]),
             )
         });
+        let mut meta = vec![Integer((slot - 1).into()), Integer(0), Integer(slot.into())];
+        if let Some((footer, block_id)) = alpenglow_meta(slot) {
+            meta.push(Array(vec![Bytes(footer)]));
+            meta.push(Bytes(block_id.to_vec()));
+        }
         root = Some(append_node(
             &mut nodes,
             Array(vec![
@@ -171,11 +202,7 @@ fn archive() -> (Vec<u8>, Vec<u8>) {
                 Integer(slot.into()),
                 Array(vec![]),
                 Array(vec![link(entry_cid)]),
-                Array(vec![
-                    Integer((slot - 1).into()),
-                    Integer(0),
-                    Integer(slot.into()),
-                ]),
+                Array(meta),
                 rewards_cid.map(link).unwrap_or(Null),
             ]),
         ));
@@ -324,6 +351,7 @@ async fn assert_callbacks_after_recycle() {
                 let first_stolen_slot = first_stolen_slot.clone();
                 async move {
                     assert_reward_commission_format(&block);
+                    assert_alpenglow_meta(&block);
                     if thread_id == 0 {
                         if !victim_paused.swap(true, Ordering::SeqCst) {
                             release_victim.notified().await;
