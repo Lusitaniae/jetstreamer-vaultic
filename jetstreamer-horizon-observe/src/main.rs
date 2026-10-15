@@ -526,6 +526,8 @@ fn scan_scratch(root: &Path) -> Result<ScratchScan> {
     Ok(scan)
 }
 
+// statvfs field widths differ across Unix platforms.
+#[allow(clippy::unnecessary_cast)]
 fn filesystem_available_bytes(path: &Path) -> Result<u64> {
     let path = CString::new(path.as_os_str().as_encoded_bytes())
         .context("filesystem path contains NUL")?;
@@ -537,9 +539,8 @@ fn filesystem_available_bytes(path: &Path) -> Result<u64> {
         std::io::Error::last_os_error()
     );
     let stats = unsafe { stats.assume_init() };
-    stats
-        .f_bavail
-        .checked_mul(stats.f_frsize)
+    (stats.f_bavail as u64)
+        .checked_mul(stats.f_frsize as u64)
         .ok_or_else(|| anyhow!("available-byte count overflow"))
 }
 
