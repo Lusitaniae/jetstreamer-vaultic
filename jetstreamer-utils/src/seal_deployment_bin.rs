@@ -423,6 +423,11 @@ fn rename_noreplace(source: &Path, destination: &Path) -> Result<(), String> {
         .map_err(|_| "stage path contains NUL".to_string())?;
     let destination = CString::new(destination.as_os_str().as_bytes())
         .map_err(|_| "destination path contains NUL".to_string())?;
+    #[cfg(target_os = "macos")]
+    // SAFETY: Both C strings remain alive for the call and contain no interior NUL.
+    let result =
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    #[cfg(not(target_os = "macos"))]
     // SAFETY: Both C strings remain alive for the syscall and contain no interior NUL.
     let result = unsafe {
         libc::syscall(
@@ -621,6 +626,65 @@ mod tests {
                 mode: 0o444,
             }],
         }
+    }
+
+    #[test]
+    fn rename_noreplace_preserves_existing_empty_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("stage");
+        let destination = directory.path().join("published");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), b"staged").unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        assert!(rename_noreplace(&source, &destination).is_err());
+        assert_eq!(fs::read(source.join("payload")).unwrap(), b"staged");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn rename_noreplace_allows_only_one_concurrent_publisher() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("published");
+        let stages = [
+            directory.path().join("first"),
+            directory.path().join("second"),
+        ];
+        for (index, stage) in stages.iter().enumerate() {
+            fs::create_dir(stage).unwrap();
+            fs::write(stage.join("payload"), [index as u8]).unwrap();
+        }
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let handles = stages
+                .iter()
+                .map(|stage| {
+                    let barrier = &barrier;
+                    let destination = &destination;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        rename_noreplace(stage, destination)
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let winner = results.iter().position(Result::is_ok).unwrap();
+        let loser = 1 - winner;
+        assert_eq!(
+            fs::read(destination.join("payload")).unwrap(),
+            [winner as u8]
+        );
+        assert!(!stages[winner].exists());
+        assert_eq!(
+            fs::read(stages[loser].join("payload")).unwrap(),
+            [loser as u8]
+        );
     }
 
     #[test]
