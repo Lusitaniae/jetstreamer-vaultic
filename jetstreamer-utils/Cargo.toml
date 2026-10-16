@@ -36,6 +36,10 @@ path = "src/seal_deployment_bin.rs"
 name = "jetstreamer-focused-capability-probe"
 path = "src/focused_capability_probe_bin.rs"
 
+[[bin]]
+name = "jetstreamer-gcs-metadata-observe"
+path = "src/gcs_metadata_observe_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
