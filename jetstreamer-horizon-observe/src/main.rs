@@ -1026,9 +1026,12 @@ fn observe_progress(
         ])
         .output()
         .context("failed to query invocation-bound replay progress")?;
+    let clean_no_match =
+        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
     ensure!(
-        output.status.success(),
-        "journalctl progress query failed: {}",
+        output.status.success() || clean_no_match,
+        "journalctl progress query failed with status {:?}: {}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stderr).trim()
     );
     ensure!(
