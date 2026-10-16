@@ -25,7 +25,7 @@ use {
 };
 
 const CONFIG_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-config-v1";
-const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v1";
+const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIOUS_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
 const SYSTEMCTL_DISCOVERY_ATTEMPTS: usize = 11;
@@ -67,6 +67,43 @@ struct UnitObservation {
     main_pid: u64,
     memory_current_bytes: u64,
     memory_peak_bytes: u64,
+    control_group: PathBuf,
+    cgroup: CgroupObservation,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CgroupObservation {
+    path: PathBuf,
+    gauges: BTreeMap<String, Option<u64>>,
+    counters: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ProgressPoint {
+    realtime_microseconds: u64,
+    slot: u64,
+    terminal_slot: u64,
+    transactions: u64,
+    account_updates: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProgressWindow {
+    journal_invocation_id: String,
+    since_unix_seconds: u64,
+    until_unix_seconds: u64,
+    matching_markers: usize,
+    first: Option<ProgressPoint>,
+    last: Option<ProgressPoint>,
+    counter_resets: u64,
+    elapsed_seconds: Option<f64>,
+    slot_delta: Option<u64>,
+    transaction_delta: Option<u64>,
+    account_update_delta: Option<u64>,
+    slots_per_second: Option<f64>,
+    transactions_per_second: Option<f64>,
+    account_updates_per_second: Option<f64>,
+    sufficient_for_rates: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -104,6 +141,8 @@ struct ReplayObservation {
     controller_after: UnitObservation,
     producer_after: UnitObservation,
     worker_after: WorkerObservation,
+    producer_cgroup_counter_delta: BTreeMap<String, u64>,
+    useful_work: ProgressWindow,
     invocation_binding_stable: bool,
 }
 
@@ -397,7 +436,7 @@ fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
             .args([
                 "show",
                 unit,
-                "--property=Id,LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak",
+                "--property=Id,LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak,ControlGroup",
             ])
             .output()
             .with_context(|| format!("failed to run systemctl for {unit}"))?;
@@ -447,8 +486,185 @@ fn numeric_property(properties: &BTreeMap<String, String>, name: &str, unit: &st
         .with_context(|| format!("invalid {name} for {unit}"))
 }
 
+fn resolve_cgroup(control_group: &str) -> Result<PathBuf> {
+    let relative = Path::new(control_group)
+        .strip_prefix("/")
+        .context("systemd control group is not absolute")?;
+    ensure!(
+        relative
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "systemd control group contains an unsafe component"
+    );
+    let root = fs::canonicalize("/sys/fs/cgroup").context("failed to resolve cgroup root")?;
+    let resolved = fs::canonicalize(root.join(relative))
+        .with_context(|| format!("failed to resolve control group {control_group}"))?;
+    ensure!(
+        resolved.starts_with(&root) && resolved != root,
+        "systemd control group escaped the cgroup root"
+    );
+    Ok(resolved)
+}
+
+fn parse_integer_file(path: &Path) -> Result<Option<u64>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read cgroup gauge {}", path.display()))?;
+    let value = text.trim();
+    if value == "max" {
+        return Ok(None);
+    }
+    Ok(Some(value.parse().with_context(|| {
+        format!("invalid cgroup gauge {}", path.display())
+    })?))
+}
+
+fn parse_counter_file(path: &Path, prefix: &str) -> Result<BTreeMap<String, u64>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read cgroup counters {}", path.display()))?;
+    let mut counters = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let name = fields
+            .next()
+            .ok_or_else(|| anyhow!("empty cgroup counter line in {}", path.display()))?;
+        let value: u64 = fields
+            .next()
+            .ok_or_else(|| anyhow!("missing cgroup counter value in {}", path.display()))?
+            .parse()
+            .with_context(|| format!("invalid cgroup counter in {}", path.display()))?;
+        ensure!(
+            fields.next().is_none(),
+            "extra cgroup counter fields in {}",
+            path.display()
+        );
+        ensure!(
+            counters.insert(format!("{prefix}.{name}"), value).is_none(),
+            "duplicate cgroup counter {name} in {}",
+            path.display()
+        );
+    }
+    Ok(counters)
+}
+
+fn parse_pressure_file(path: &Path, prefix: &str) -> Result<BTreeMap<String, u64>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read cgroup pressure {}", path.display()))?;
+    let mut counters = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let class = fields
+            .next()
+            .ok_or_else(|| anyhow!("empty cgroup pressure line in {}", path.display()))?;
+        let mut total = None;
+        for field in fields {
+            if let Some(value) = field.strip_prefix("total=") {
+                ensure!(
+                    total.is_none(),
+                    "duplicate pressure total in {}",
+                    path.display()
+                );
+                total =
+                    Some(value.parse().with_context(|| {
+                        format!("invalid pressure total in {}", path.display())
+                    })?);
+            }
+        }
+        let total = total.ok_or_else(|| anyhow!("pressure total missing in {}", path.display()))?;
+        ensure!(
+            counters
+                .insert(format!("{prefix}.{class}_total_usec"), total)
+                .is_none(),
+            "duplicate pressure class {class} in {}",
+            path.display()
+        );
+    }
+    Ok(counters)
+}
+
+fn parse_io_stat(path: &Path) -> Result<BTreeMap<String, u64>> {
+    let text = fs::read_to_string(path)
+        .with_context(|| format!("failed to read cgroup I/O counters {}", path.display()))?;
+    let mut counters = BTreeMap::new();
+    for line in text.lines() {
+        let mut fields = line.split_whitespace();
+        let _device = fields
+            .next()
+            .ok_or_else(|| anyhow!("empty cgroup I/O line in {}", path.display()))?;
+        for field in fields {
+            let (name, value) = field
+                .split_once('=')
+                .ok_or_else(|| anyhow!("invalid cgroup I/O field in {}", path.display()))?;
+            let value: u64 = value
+                .parse()
+                .with_context(|| format!("invalid cgroup I/O value in {}", path.display()))?;
+            let key = format!("io.{name}");
+            let current = counters.entry(key).or_insert(0_u64);
+            *current = current
+                .checked_add(value)
+                .ok_or_else(|| anyhow!("cgroup I/O counter overflow"))?;
+        }
+    }
+    Ok(counters)
+}
+
+fn observe_cgroup(control_group: &str) -> Result<CgroupObservation> {
+    let path = resolve_cgroup(control_group)?;
+    let mut gauges = BTreeMap::new();
+    for name in ["memory.current", "memory.peak", "pids.current", "pids.peak"] {
+        gauges.insert(name.to_owned(), parse_integer_file(&path.join(name))?);
+    }
+    let mut counters = BTreeMap::new();
+    for (filename, prefix) in [
+        ("cpu.stat", "cpu"),
+        ("memory.stat", "memory_stat"),
+        ("memory.events", "memory_events"),
+    ] {
+        counters.extend(parse_counter_file(&path.join(filename), prefix)?);
+    }
+    for (filename, prefix) in [
+        ("cpu.pressure", "cpu_pressure"),
+        ("memory.pressure", "memory_pressure"),
+        ("io.pressure", "io_pressure"),
+    ] {
+        counters.extend(parse_pressure_file(&path.join(filename), prefix)?);
+    }
+    counters.extend(parse_io_stat(&path.join("io.stat"))?);
+    Ok(CgroupObservation {
+        path,
+        gauges,
+        counters,
+    })
+}
+
+fn counter_deltas(
+    before: &BTreeMap<String, u64>,
+    after: &BTreeMap<String, u64>,
+) -> Result<BTreeMap<String, u64>> {
+    ensure!(
+        before.keys().eq(after.keys()),
+        "cgroup counter set changed during observation"
+    );
+    before
+        .iter()
+        .map(|(name, before_value)| {
+            let after_value = after[name];
+            ensure!(
+                after_value >= *before_value,
+                "cgroup counter {name} decreased during observation"
+            );
+            Ok((name.clone(), after_value - before_value))
+        })
+        .collect()
+}
+
 fn observe_unit(unit: &str, expected_invocation: &str) -> Result<UnitObservation> {
     let properties = systemctl_properties(unit)?;
+    let control_group = PathBuf::from(required_property(&properties, "ControlGroup", unit)?);
+    let cgroup = observe_cgroup(
+        control_group
+            .to_str()
+            .ok_or_else(|| anyhow!("non-UTF-8 control group for {unit}"))?,
+    )?;
     let observation = UnitObservation {
         unit: unit.to_owned(),
         invocation_id: required_property(&properties, "InvocationID", unit)?.to_owned(),
@@ -460,6 +676,8 @@ fn observe_unit(unit: &str, expected_invocation: &str) -> Result<UnitObservation
         main_pid: numeric_property(&properties, "MainPID", unit)?,
         memory_current_bytes: numeric_property(&properties, "MemoryCurrent", unit)?,
         memory_peak_bytes: numeric_property(&properties, "MemoryPeak", unit)?,
+        control_group,
+        cgroup,
     };
     ensure!(observation.load_state == "loaded", "{unit} is not loaded");
     ensure!(observation.active_state == "active", "{unit} is not active");
@@ -658,6 +876,8 @@ fn vm_max_map_count() -> Result<u64> {
 
 fn stable_unit(before: &UnitObservation, after: &UnitObservation) -> bool {
     before.invocation_id == after.invocation_id
+        && before.control_group == after.control_group
+        && before.cgroup.path == after.cgroup.path
         && before.restarts == 0
         && after.restarts == 0
         && after.load_state == "loaded"
@@ -672,6 +892,173 @@ fn stable_worker(before: &WorkerObservation, after: &WorkerObservation) -> bool 
         && after.matching_workers == 1
         && before.executable_beneath_bound_scratch
         && after.executable_beneath_bound_scratch
+}
+
+fn decimal_after(message: &str, prefix: &str) -> Option<u64> {
+    let start = message.find(prefix)?.checked_add(prefix.len())?;
+    let digits = message[start..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digits == 0 {
+        return None;
+    }
+    message[start..start + digits].parse().ok()
+}
+
+fn parse_progress_point(message: &str, realtime_microseconds: u64) -> Option<ProgressPoint> {
+    let marker = "progress slot ";
+    let slot_start = message.find(marker)?.checked_add(marker.len())?;
+    let remaining = &message[slot_start..];
+    let slash = remaining.find('/')?;
+    let slot = remaining[..slash].parse().ok()?;
+    let terminal_digits = remaining[slash + 1..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if terminal_digits == 0 {
+        return None;
+    }
+    let terminal_slot = remaining[slash + 1..slash + 1 + terminal_digits]
+        .parse()
+        .ok()?;
+    Some(ProgressPoint {
+        realtime_microseconds,
+        slot,
+        terminal_slot,
+        transactions: decimal_after(message, "txs=")?,
+        account_updates: decimal_after(message, "accounts=")?,
+    })
+}
+
+fn accumulate_counter(previous: u64, current: u64, total: &mut u64) -> Result<bool> {
+    let (delta, reset) = if current >= previous {
+        (current - previous, false)
+    } else {
+        (current, true)
+    };
+    *total = total
+        .checked_add(delta)
+        .ok_or_else(|| anyhow!("progress counter delta overflow"))?;
+    Ok(reset)
+}
+
+fn progress_window_from_points(
+    invocation_id: &str,
+    since_unix_seconds: u64,
+    until_unix_seconds: u64,
+    mut points: Vec<ProgressPoint>,
+) -> Result<ProgressWindow> {
+    points.sort_by_key(|point| point.realtime_microseconds);
+    let matching_markers = points.len();
+    let first = points.first().cloned();
+    let last = points.last().cloned();
+    let mut counter_resets = 0_u64;
+    let mut slot_delta = 0_u64;
+    let mut transaction_delta = 0_u64;
+    let mut account_update_delta = 0_u64;
+    for pair in points.windows(2) {
+        ensure!(
+            pair[1].realtime_microseconds >= pair[0].realtime_microseconds,
+            "journal progress timestamps moved backwards"
+        );
+        counter_resets += u64::from(accumulate_counter(
+            pair[0].slot,
+            pair[1].slot,
+            &mut slot_delta,
+        )?);
+        counter_resets += u64::from(accumulate_counter(
+            pair[0].transactions,
+            pair[1].transactions,
+            &mut transaction_delta,
+        )?);
+        counter_resets += u64::from(accumulate_counter(
+            pair[0].account_updates,
+            pair[1].account_updates,
+            &mut account_update_delta,
+        )?);
+    }
+    let elapsed_seconds = match (&first, &last) {
+        (Some(first), Some(last)) if matching_markers >= 2 => {
+            Some((last.realtime_microseconds - first.realtime_microseconds) as f64 / 1_000_000.0)
+        }
+        _ => None,
+    };
+    let sufficient_for_rates = elapsed_seconds.is_some_and(|elapsed| elapsed > 0.0);
+    let rate = |delta: u64| {
+        elapsed_seconds
+            .filter(|elapsed| *elapsed > 0.0)
+            .map(|elapsed| delta as f64 / elapsed)
+    };
+    Ok(ProgressWindow {
+        journal_invocation_id: invocation_id.to_owned(),
+        since_unix_seconds,
+        until_unix_seconds,
+        matching_markers,
+        first,
+        last,
+        counter_resets,
+        elapsed_seconds,
+        slot_delta: sufficient_for_rates.then_some(slot_delta),
+        transaction_delta: sufficient_for_rates.then_some(transaction_delta),
+        account_update_delta: sufficient_for_rates.then_some(account_update_delta),
+        slots_per_second: rate(slot_delta),
+        transactions_per_second: rate(transaction_delta),
+        account_updates_per_second: rate(account_update_delta),
+        sufficient_for_rates,
+    })
+}
+
+fn observe_progress(
+    invocation_id: &str,
+    since_unix_seconds: u64,
+    until_unix_seconds: u64,
+) -> Result<ProgressWindow> {
+    let output = Command::new("journalctl")
+        .args([
+            "--no-pager",
+            "--output=json",
+            "--output-fields=MESSAGE,__REALTIME_TIMESTAMP",
+            "--grep=progress slot ",
+            &format!("--since=@{since_unix_seconds}"),
+            &format!("--until=@{until_unix_seconds}"),
+            &format!("_SYSTEMD_INVOCATION_ID={invocation_id}"),
+        ])
+        .output()
+        .context("failed to query invocation-bound replay progress")?;
+    ensure!(
+        output.status.success(),
+        "journalctl progress query failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    ensure!(
+        output.stdout.len() <= 16 * 1024 * 1024,
+        "journalctl progress output exceeds size bound"
+    );
+    let text = std::str::from_utf8(&output.stdout).context("journal output is not UTF-8")?;
+    let mut points = Vec::new();
+    for line in text.lines() {
+        let value: Value = serde_json::from_str(line).context("invalid journal JSON")?;
+        let Some(message) = value.get("MESSAGE").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(timestamp) = value
+            .get("__REALTIME_TIMESTAMP")
+            .and_then(Value::as_str)
+            .and_then(|timestamp| timestamp.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if let Some(point) = parse_progress_point(message, timestamp) {
+            points.push(point);
+        }
+    }
+    progress_window_from_points(
+        invocation_id,
+        since_unix_seconds,
+        until_unix_seconds,
+        points,
+    )
 }
 
 fn write_no_clobber(path: &Path, value: &Value) -> Result<()> {
@@ -736,6 +1123,15 @@ fn run(config: Config) -> Result<()> {
         )?;
         let worker_after =
             observe_worker(&replay.scratch_path, &replay.worker_executable_basename)?;
+        let producer_cgroup_counter_delta = counter_deltas(
+            &producer_before.cgroup.counters,
+            &producer_after.cgroup.counters,
+        )?;
+        let useful_work = observe_progress(
+            &replay.expected_producer_invocation_id,
+            previous_unix,
+            started_unix,
+        )?;
         let invocation_binding_stable = stable_unit(&controller_before, &controller_after)
             && stable_unit(&producer_before, &producer_after)
             && stable_worker(&worker_before, &worker_after);
@@ -764,6 +1160,8 @@ fn run(config: Config) -> Result<()> {
             controller_after,
             producer_after,
             worker_after,
+            producer_cgroup_counter_delta,
+            useful_work,
             invocation_binding_stable,
         });
     }
@@ -916,5 +1314,67 @@ mod tests {
         let unit = "jetstreamer-example.service";
         assert!(systemctl_whoami_matches(b"jetstreamer-example.service\n", unit).unwrap());
         assert!(!systemctl_whoami_matches(b"jetstreamer-other.service\n", unit).unwrap());
+    }
+
+    #[test]
+    fn cgroup_parsers_preserve_pressure_fault_and_io_counters() {
+        let directory = tempfile::tempdir().unwrap();
+        let memory = directory.path().join("memory.stat");
+        let pressure = directory.path().join("memory.pressure");
+        let io = directory.path().join("io.stat");
+        fs::write(&memory, "anon 12\npgmajfault 7\n").unwrap();
+        fs::write(
+            &pressure,
+            "some avg10=0.00 avg60=0.01 avg300=0.02 total=41\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=3\n",
+        )
+        .unwrap();
+        fs::write(
+            &io,
+            "8:0 rbytes=10 wbytes=20 rios=1 wios=2\n8:1 rbytes=30 wbytes=40 rios=3 wios=4\n",
+        )
+        .unwrap();
+        let memory = parse_counter_file(&memory, "memory_stat").unwrap();
+        let pressure = parse_pressure_file(&pressure, "memory_pressure").unwrap();
+        let io = parse_io_stat(&io).unwrap();
+        assert_eq!(memory["memory_stat.pgmajfault"], 7);
+        assert_eq!(pressure["memory_pressure.some_total_usec"], 41);
+        assert_eq!(pressure["memory_pressure.full_total_usec"], 3);
+        assert_eq!(io["io.rbytes"], 40);
+        assert_eq!(io["io.wbytes"], 60);
+        assert_eq!(io["io.rios"], 4);
+        assert_eq!(io["io.wios"], 6);
+    }
+
+    #[test]
+    fn progress_window_reports_useful_work_and_counter_resets() {
+        let points = vec![
+            parse_progress_point(
+                "progress slot 100/199 (10.0%) txs=1000 accounts=2000",
+                1_000_000,
+            )
+            .unwrap(),
+            parse_progress_point(
+                "progress slot 150/199 (20.0%) txs=1500 accounts=2800",
+                3_000_000,
+            )
+            .unwrap(),
+            parse_progress_point("progress slot 200/299 (0.1%) txs=25 accounts=40", 5_000_000)
+                .unwrap(),
+        ];
+        let window =
+            progress_window_from_points("0123456789abcdef0123456789abcdef", 1, 5, points).unwrap();
+        assert!(window.sufficient_for_rates);
+        assert_eq!(window.slot_delta, Some(100));
+        assert_eq!(window.transaction_delta, Some(525));
+        assert_eq!(window.account_update_delta, Some(840));
+        assert_eq!(window.counter_resets, 2);
+        assert_eq!(window.transactions_per_second, Some(131.25));
+        assert_eq!(window.account_updates_per_second, Some(210.0));
+    }
+
+    #[test]
+    fn progress_parser_rejects_non_progress_messages() {
+        assert!(parse_progress_point("slot 10 txs=2 accounts=3", 1).is_none());
+        assert!(parse_progress_point("progress slot 10/20 txs=x accounts=3", 1).is_none());
     }
 }
