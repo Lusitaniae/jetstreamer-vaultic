@@ -198,7 +198,8 @@ fn is_sha256(value: &str) -> bool {
 fn hash_reader(mut reader: impl Read) -> Result<(String, u64)> {
     let mut digest = Sha256::new();
     let mut bytes = 0u64;
-    let mut buffer = [0u8; 8 * 1024 * 1024];
+    // Keep the large streaming buffer off the main thread's default stack.
+    let mut buffer = vec![0u8; 8 * 1024 * 1024];
     loop {
         let count = reader.read(&mut buffer)?;
         if count == 0 {
@@ -1080,5 +1081,13 @@ mod tests {
         validate_plan(&plan).unwrap();
         plan.terminal_slot = MAX_SLOT_EXCLUSIVE;
         assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn hashes_input_larger_than_the_default_thread_stack() {
+        let input = vec![0x5au8; 9 * 1024 * 1024];
+        let (digest, bytes) = hash_reader(input.as_slice()).unwrap();
+        assert_eq!(bytes, input.len() as u64);
+        assert_eq!(digest, format!("{:x}", Sha256::digest(&input)));
     }
 }
