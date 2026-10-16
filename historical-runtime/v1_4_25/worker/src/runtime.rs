@@ -1136,8 +1136,11 @@ mod tests {
     use solana_runtime::genesis_utils::create_genesis_config_with_leader;
     use solana_sdk::{
         account::Account,
+        bpf_loader_upgradeable::{self, UpgradeableLoaderState},
+        feature::{self, Feature},
         hash::hashv,
         instruction::{AccountMeta, Instruction},
+        loader_upgradeable_instruction::UpgradeableLoaderInstruction,
         signature::{Keypair, Signer},
         system_instruction, system_program, system_transaction, sysvar,
     };
@@ -1329,6 +1332,80 @@ mod tests {
         assert_eq!(
             builtins.feature_builtins[0].1,
             feature_set::bpf_loader_upgradeable_program::id()
+        );
+    }
+
+    #[test]
+    fn feature_activated_upgradeable_loader_dispatches_statically() {
+        let leader = Pubkey::new_from_array([7; 32]);
+        let mut genesis = create_genesis_config_with_leader(10_000_000_000, &leader, 500_000);
+        set_exact_mainnet_native_programs(&mut genesis.genesis_config);
+        let feature_balance = genesis
+            .genesis_config
+            .rent
+            .minimum_balance(Feature::size_of())
+            .max(1);
+        genesis.genesis_config.accounts.insert(
+            feature_set::bpf_loader_upgradeable_program::id(),
+            feature::create_account(
+                &Feature {
+                    activated_at: Some(0),
+                },
+                feature_balance,
+            ),
+        );
+
+        let state_dir = snapshot::private_state_dir(None).unwrap();
+        let account_paths = snapshot::private_account_paths(&state_dir).unwrap();
+        let builtins = mainnet_additional_builtins();
+        let bank = Bank::new_with_paths(
+            &genesis.genesis_config,
+            account_paths,
+            &[],
+            None,
+            Some(&builtins),
+            HashSet::new(),
+        );
+        assert!(bank
+            .feature_set
+            .is_active(&feature_set::bpf_loader_upgradeable_program::id()));
+        let mut state = RuntimeState::from_test_bank(bank, true, state_dir);
+        let buffer = Keypair::new();
+        let buffer_len = UpgradeableLoaderState::buffer_len(0).unwrap();
+        let buffer_lamports = state
+            .bank
+            .get_minimum_balance_for_rent_exemption(buffer_len)
+            .max(1);
+        let transaction = Transaction::new_signed_with_payer(
+            &[
+                system_instruction::create_account(
+                    &genesis.mint_keypair.pubkey(),
+                    &buffer.pubkey(),
+                    buffer_lamports,
+                    buffer_len as u64,
+                    &bpf_loader_upgradeable::id(),
+                ),
+                Instruction::new(
+                    bpf_loader_upgradeable::id(),
+                    &UpgradeableLoaderInstruction::InitializeBuffer,
+                    vec![
+                        AccountMeta::new(buffer.pubkey(), false),
+                        AccountMeta::new(buffer.pubkey(), true),
+                    ],
+                ),
+            ],
+            Some(&genesis.mint_keypair.pubkey()),
+            &[&genesis.mint_keypair, &buffer],
+            state.bank.last_blockhash(),
+        );
+
+        let processed = state
+            .process_entry(request_for(&state, 0, 0, 1, &[transaction]))
+            .unwrap();
+        assert_eq!(processed.outcomes[0].error, None);
+        assert_eq!(
+            state.bank.get_account(&buffer.pubkey()).unwrap().owner,
+            bpf_loader_upgradeable::id()
         );
     }
 
