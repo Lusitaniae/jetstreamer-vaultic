@@ -106,6 +106,29 @@ struct ProgressWindow {
     sufficient_for_rates: bool,
 }
 
+#[derive(Debug, Serialize)]
+struct CrossSampleObservation {
+    previous_sample_schema: String,
+    previous_completed_at_utc: String,
+    elapsed_seconds: u64,
+    producer_cgroup_counter_delta: BTreeMap<String, u64>,
+    effective_cpu_cores: Option<f64>,
+    physical_scratch_delta_bytes: i128,
+    worker_vma_delta: i128,
+    physical_scratch_bytes_per_million_transactions: Option<f64>,
+    worker_vmas_per_million_transactions: Option<f64>,
+}
+
+#[derive(Debug)]
+struct PreviousReplayObservation {
+    schema: String,
+    completed_at_utc: String,
+    completed_unix: u64,
+    producer_cgroup_counters: BTreeMap<String, u64>,
+    physical_scratch_bytes: u64,
+    worker_vmas: u64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct ScratchScan {
     physical_bytes: u64,
@@ -143,6 +166,7 @@ struct ReplayObservation {
     worker_after: WorkerObservation,
     producer_cgroup_counter_delta: BTreeMap<String, u64>,
     useful_work: ProgressWindow,
+    cross_sample: Option<CrossSampleObservation>,
     invocation_binding_stable: bool,
 }
 
@@ -354,12 +378,25 @@ fn receipt_timestamp(value: &Value) -> Result<&str> {
     }
 }
 
-fn previous_sample(path: &Path) -> Result<(Vec<u8>, String, u64)> {
+fn previous_sample(path: &Path) -> Result<(Vec<u8>, Value, String, u64)> {
     let bytes = read_bounded(path, MAX_PREVIOUS_SAMPLE_BYTES, "previous sample")?;
     let value: Value = serde_json::from_slice(&bytes).context("invalid previous sample JSON")?;
     let timestamp = receipt_timestamp(&value)?;
     let unix = parse_receipt_utc(timestamp)?;
-    Ok((bytes, timestamp.to_owned(), unix))
+    let timestamp = timestamp.to_owned();
+    Ok((bytes, value, timestamp, unix))
+}
+
+fn progress_window_start(previous: &Value, fallback_unix: u64) -> Result<u64> {
+    if previous.get("schema").and_then(Value::as_str) != Some(OUTPUT_SCHEMA) {
+        return Ok(fallback_unix);
+    }
+    let completed_at_utc = previous
+        .get("completed_at_utc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("previous v2 sample lacks completed_at_utc"))?;
+    parse_receipt_utc(completed_at_utc)
+        .context("previous v2 sample has invalid completion timestamp")
 }
 
 fn parse_systemctl_properties(stdout: &[u8], unit: &str) -> Result<BTreeMap<String, String>> {
@@ -655,6 +692,130 @@ fn counter_deltas(
             Ok((name.clone(), after_value - before_value))
         })
         .collect()
+}
+
+fn json_u64(value: &Value, field: &str) -> Result<u64> {
+    value
+        .as_u64()
+        .ok_or_else(|| anyhow!("previous sample has invalid {field}"))
+}
+
+fn json_counter_map(value: &Value, field: &str) -> Result<BTreeMap<String, u64>> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("previous sample has invalid {field}"))?;
+    object
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), json_u64(value, field)?)))
+        .collect()
+}
+
+fn previous_replay_observation(
+    previous: &Value,
+    range: &str,
+    expected_producer_invocation_id: &str,
+) -> Result<Option<PreviousReplayObservation>> {
+    let Some(schema) = previous.get("schema").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    if schema != OUTPUT_SCHEMA {
+        return Ok(None);
+    }
+    let completed_at_utc = previous
+        .get("completed_at_utc")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("previous v2 sample lacks completed_at_utc"))?;
+    let completed_unix = parse_receipt_utc(completed_at_utc)
+        .context("previous v2 sample has invalid completion timestamp")?;
+    let replays = previous
+        .get("replays")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("previous v2 sample lacks replay observations"))?;
+    let mut matches = replays
+        .iter()
+        .filter(|replay| replay.get("range").and_then(Value::as_str) == Some(range));
+    let Some(replay) = matches.next() else {
+        return Ok(None);
+    };
+    ensure!(
+        matches.next().is_none(),
+        "previous v2 sample has duplicate observations for range {range}"
+    );
+    let producer_after = replay
+        .get("producer_after")
+        .ok_or_else(|| anyhow!("previous v2 sample lacks producer_after for {range}"))?;
+    if producer_after.get("invocation_id").and_then(Value::as_str)
+        != Some(expected_producer_invocation_id)
+    {
+        return Ok(None);
+    }
+    let counters = producer_after
+        .pointer("/cgroup/counters")
+        .ok_or_else(|| anyhow!("previous v2 sample lacks cgroup counters for {range}"))?;
+    let physical_scratch_bytes = replay
+        .get("conservative_observed_physical_bytes")
+        .ok_or_else(|| anyhow!("previous v2 sample lacks scratch bytes for {range}"))?;
+    let worker_vmas = replay
+        .pointer("/worker_after/vmas")
+        .ok_or_else(|| anyhow!("previous v2 sample lacks worker VMAs for {range}"))?;
+    Ok(Some(PreviousReplayObservation {
+        schema: schema.to_owned(),
+        completed_at_utc: completed_at_utc.to_owned(),
+        completed_unix,
+        producer_cgroup_counters: json_counter_map(counters, "cgroup counters")?,
+        physical_scratch_bytes: json_u64(physical_scratch_bytes, "scratch bytes")?,
+        worker_vmas: json_u64(worker_vmas, "worker VMAs")?,
+    }))
+}
+
+fn cross_sample_observation(
+    previous: &Value,
+    replay: &ReplayConfig,
+    started_unix: u64,
+    producer_before: &UnitObservation,
+    worker_before: &WorkerObservation,
+    conservative_physical_scratch_bytes: u64,
+    useful_work: &ProgressWindow,
+) -> Result<Option<CrossSampleObservation>> {
+    let Some(previous) = previous_replay_observation(
+        previous,
+        &replay.range,
+        &replay.expected_producer_invocation_id,
+    )?
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        started_unix > previous.completed_unix,
+        "current sample does not follow previous completion for {}",
+        replay.range
+    );
+    let elapsed_seconds = started_unix - previous.completed_unix;
+    let producer_cgroup_counter_delta = counter_deltas(
+        &previous.producer_cgroup_counters,
+        &producer_before.cgroup.counters,
+    )?;
+    let effective_cpu_cores = producer_cgroup_counter_delta
+        .get("cpu.usage_usec")
+        .map(|usage| *usage as f64 / (elapsed_seconds as f64 * 1_000_000.0));
+    let physical_scratch_delta_bytes = i128::from(conservative_physical_scratch_bytes)
+        - i128::from(previous.physical_scratch_bytes);
+    let worker_vma_delta = i128::from(worker_before.vmas) - i128::from(previous.worker_vmas);
+    let transaction_delta = useful_work.transaction_delta.filter(|delta| *delta > 0);
+    let per_million = |delta: i128| {
+        transaction_delta.map(|transactions| delta as f64 * 1_000_000.0 / transactions as f64)
+    };
+    Ok(Some(CrossSampleObservation {
+        previous_sample_schema: previous.schema,
+        previous_completed_at_utc: previous.completed_at_utc,
+        elapsed_seconds,
+        producer_cgroup_counter_delta,
+        effective_cpu_cores,
+        physical_scratch_delta_bytes,
+        worker_vma_delta,
+        physical_scratch_bytes_per_million_transactions: per_million(physical_scratch_delta_bytes),
+        worker_vmas_per_million_transactions: per_million(worker_vma_delta),
+    }))
 }
 
 fn observe_unit(unit: &str, expected_invocation: &str) -> Result<UnitObservation> {
@@ -1081,7 +1242,7 @@ fn write_no_clobber(path: &Path, value: &Value) -> Result<()> {
 }
 
 fn run(config: Config) -> Result<()> {
-    let (previous_bytes, previous_timestamp, previous_unix) =
+    let (previous_bytes, previous_value, previous_timestamp, previous_unix) =
         previous_sample(&config.previous_sample)?;
     let started_unix = now_unix()?;
     ensure!(
@@ -1102,6 +1263,11 @@ fn run(config: Config) -> Result<()> {
 
     let available_before = filesystem_available_bytes(&config.filesystem_path)?;
     let (memory_total_kib, memory_available_before_kib) = host_memory()?;
+    let progress_since_unix = progress_window_start(&previous_value, previous_unix)?;
+    ensure!(
+        started_unix >= progress_since_unix,
+        "current clock predates previous sample completion"
+    );
     let mut observations = Vec::with_capacity(config.replays.len());
     for replay in &config.replays {
         let controller_before = observe_unit(
@@ -1132,8 +1298,20 @@ fn run(config: Config) -> Result<()> {
         )?;
         let useful_work = observe_progress(
             &replay.expected_producer_invocation_id,
-            previous_unix,
+            progress_since_unix,
             started_unix,
+        )?;
+        let conservative_observed_physical_bytes = scratch_pass_1
+            .physical_bytes
+            .max(scratch_pass_2.physical_bytes);
+        let cross_sample = cross_sample_observation(
+            &previous_value,
+            replay,
+            started_unix,
+            &producer_before,
+            &worker_before,
+            conservative_observed_physical_bytes,
+            &useful_work,
         )?;
         let invocation_binding_stable = stable_unit(&controller_before, &controller_after)
             && stable_unit(&producer_before, &producer_after)
@@ -1143,9 +1321,6 @@ fn run(config: Config) -> Result<()> {
             "{} invocation or worker changed during observation",
             replay.range
         );
-        let conservative_observed_physical_bytes = scratch_pass_1
-            .physical_bytes
-            .max(scratch_pass_2.physical_bytes);
         let within_sample_physical_delta_bytes =
             i128::from(scratch_pass_2.physical_bytes) - i128::from(scratch_pass_1.physical_bytes);
         observations.push(ReplayObservation {
@@ -1165,6 +1340,7 @@ fn run(config: Config) -> Result<()> {
             worker_after,
             producer_cgroup_counter_delta,
             useful_work,
+            cross_sample,
             invocation_binding_stable,
         });
     }
@@ -1379,5 +1555,139 @@ mod tests {
     fn progress_parser_rejects_non_progress_messages() {
         assert!(parse_progress_point("slot 10 txs=2 accounts=3", 1).is_none());
         assert!(parse_progress_point("progress slot 10/20 txs=x accounts=3", 1).is_none());
+    }
+
+    #[test]
+    fn v2_progress_window_begins_after_the_previous_scan() {
+        let previous = serde_json::json!({
+            "schema": OUTPUT_SCHEMA,
+            "recorded_at_utc": "2026-10-16T08:35:59Z",
+            "completed_at_utc": "2026-10-16T08:36:07Z"
+        });
+        assert_eq!(
+            progress_window_start(&previous, parse_utc("2026-10-16T08:35:59Z").unwrap()).unwrap(),
+            parse_utc("2026-10-16T08:36:07Z").unwrap()
+        );
+
+        let legacy = serde_json::json!({"recorded_at_utc": "2026-10-16T08:35:59Z"});
+        assert_eq!(progress_window_start(&legacy, 42).unwrap(), 42);
+    }
+
+    #[test]
+    fn cross_sample_reports_invocation_bound_resource_efficiency() {
+        let invocation = "0123456789abcdef0123456789abcdef";
+        let previous = serde_json::json!({
+            "schema": OUTPUT_SCHEMA,
+            "recorded_at_utc": "2026-10-16T08:35:59Z",
+            "completed_at_utc": "2026-10-16T08:36:00Z",
+            "replays": [{
+                "range": "216-219",
+                "producer_after": {
+                    "invocation_id": invocation,
+                    "cgroup": {"counters": {
+                        "cpu.usage_usec": 1_000_000,
+                        "io.rbytes": 100
+                    }}
+                },
+                "conservative_observed_physical_bytes": 1_000,
+                "worker_after": {"vmas": 100}
+            }]
+        });
+        let replay = ReplayConfig {
+            range: "216-219".to_owned(),
+            controller_unit: "controller.service".to_owned(),
+            expected_controller_invocation_id: invocation.to_owned(),
+            producer_unit: "producer.service".to_owned(),
+            expected_producer_invocation_id: invocation.to_owned(),
+            scratch_path: PathBuf::from("/scratch"),
+            worker_executable_basename: "worker".to_owned(),
+        };
+        let producer_before = UnitObservation {
+            unit: "producer.service".to_owned(),
+            invocation_id: invocation.to_owned(),
+            load_state: "loaded".to_owned(),
+            active_state: "active".to_owned(),
+            sub_state: "running".to_owned(),
+            result: "success".to_owned(),
+            restarts: 0,
+            main_pid: 1,
+            memory_current_bytes: 0,
+            memory_peak_bytes: 0,
+            control_group: PathBuf::from("/system.slice/producer.service"),
+            cgroup: CgroupObservation {
+                path: PathBuf::from("/sys/fs/cgroup/system.slice/producer.service"),
+                gauges: BTreeMap::new(),
+                counters: BTreeMap::from([
+                    ("cpu.usage_usec".to_owned(), 3_601_000_000),
+                    ("io.rbytes".to_owned(), 300),
+                ]),
+            },
+        };
+        let worker_before = WorkerObservation {
+            pid: 2,
+            executable: PathBuf::from("/scratch/worker"),
+            executable_beneath_bound_scratch: true,
+            vmas: 120,
+            matching_workers: 1,
+        };
+        let useful_work = ProgressWindow {
+            journal_invocation_id: invocation.to_owned(),
+            since_unix_seconds: parse_utc("2026-10-16T08:36:00Z").unwrap(),
+            until_unix_seconds: parse_utc("2026-10-16T09:06:00Z").unwrap(),
+            matching_markers: 2,
+            first: None,
+            last: None,
+            counter_resets: 0,
+            elapsed_seconds: Some(1_800.0),
+            slot_delta: Some(1),
+            transaction_delta: Some(2_000_000),
+            account_update_delta: Some(3_000_000),
+            slots_per_second: Some(1.0 / 1_800.0),
+            transactions_per_second: Some(2_000_000.0 / 1_800.0),
+            account_updates_per_second: Some(3_000_000.0 / 1_800.0),
+            sufficient_for_rates: true,
+        };
+        let observation = cross_sample_observation(
+            &previous,
+            &replay,
+            parse_utc("2026-10-16T09:06:00Z").unwrap(),
+            &producer_before,
+            &worker_before,
+            1_500,
+            &useful_work,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(observation.elapsed_seconds, 1_800);
+        assert_eq!(
+            observation.producer_cgroup_counter_delta["cpu.usage_usec"],
+            3_600_000_000
+        );
+        assert_eq!(observation.effective_cpu_cores, Some(2.0));
+        assert_eq!(observation.physical_scratch_delta_bytes, 500);
+        assert_eq!(observation.worker_vma_delta, 20);
+        assert_eq!(
+            observation.physical_scratch_bytes_per_million_transactions,
+            Some(250.0)
+        );
+        assert_eq!(observation.worker_vmas_per_million_transactions, Some(10.0));
+
+        let missing = ReplayConfig {
+            range: "220-223".to_owned(),
+            ..replay
+        };
+        assert!(
+            cross_sample_observation(
+                &previous,
+                &missing,
+                parse_utc("2026-10-16T09:06:00Z").unwrap(),
+                &producer_before,
+                &worker_before,
+                1_500,
+                &useful_work,
+            )
+            .unwrap()
+            .is_none()
+        );
     }
 }
