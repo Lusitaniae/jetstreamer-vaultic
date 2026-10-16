@@ -725,7 +725,7 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         "package receipt path is not canonical for the epoch"
     );
     let expected_probe_root = format!(
-        "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v1",
+        "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v2",
         plan.epoch
     );
     ensure!(
@@ -869,12 +869,18 @@ fn run() -> Result<()> {
         .env("JETSTREAMER_PRIVATE_RUN_ROOT", &private_root)
         .env("RUST_LOG", "info")
         .env("SOLANA_RAYON_THREADS", "16")
-        .current_dir(&plan.package)
-        .uid(plan.run_uid)
-        .gid(plan.run_gid);
+        .current_dir(&plan.package);
+    let run_uid = plan.run_uid;
+    let run_gid = plan.run_gid;
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setgroups(0, std::ptr::null()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setgid(run_gid) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::setuid(run_uid) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -1015,7 +1021,7 @@ mod tests {
             snapshot_sha256: "3".repeat(64),
             checkpoint_name: "epoch-hashes-209-complete-span.txt".to_string(),
             checkpoint_sha256: "4".repeat(64),
-            probe_root: "/home/ubuntu/.jetstreamer-private/qualification-209/package-capability-probe-rust-ca2e38b-v1".into(),
+            probe_root: "/home/ubuntu/.jetstreamer-private/qualification-209/package-capability-probe-rust-ca2e38b-v2".into(),
             receipt: "/home/ubuntu/.jetstreamer-private/campaign-state/epoch209-complete-span-package-capability-ca2e38b-rust-20261016-v1.json".into(),
             run_uid: 1000,
             run_gid: 1000,
