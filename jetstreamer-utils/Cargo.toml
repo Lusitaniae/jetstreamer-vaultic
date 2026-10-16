@@ -32,6 +32,10 @@ path = "src/blockzilla_boundary_collect_bin.rs"
 name = "jetstreamer-seal-deployment"
 path = "src/seal_deployment_bin.rs"
 
+[[bin]]
+name = "jetstreamer-focused-capability-probe"
+path = "src/focused_capability_probe_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
@@ -43,3 +47,4 @@ bs58 = { workspace = true, features = ["alloc"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2.workspace = true
+anyhow.workspace = true
