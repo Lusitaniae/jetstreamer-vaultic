@@ -19,7 +19,8 @@ use {
         os::unix::fs::{MetadataExt as _, OpenOptionsExt as _},
         path::{Path, PathBuf},
         process::Command,
-        time::{SystemTime, UNIX_EPOCH},
+        thread,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
 };
 
@@ -27,6 +28,8 @@ const CONFIG_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-config-v1"
 const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIOUS_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
+const SYSTEMCTL_DISCOVERY_ATTEMPTS: usize = 3;
+const SYSTEMCTL_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -320,21 +323,8 @@ fn previous_sample(path: &Path) -> Result<(Vec<u8>, String, u64)> {
     Ok((bytes, timestamp.to_owned(), unix))
 }
 
-fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
-    let output = Command::new("systemctl")
-        .args([
-            "show",
-            unit,
-            "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak",
-        ])
-        .output()
-        .with_context(|| format!("failed to run systemctl for {unit}"))?;
-    ensure!(
-        output.status.success(),
-        "systemctl failed for {unit}: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    let stdout = std::str::from_utf8(&output.stdout).context("systemctl output is not UTF-8")?;
+fn parse_systemctl_properties(stdout: &[u8], unit: &str) -> Result<BTreeMap<String, String>> {
+    let stdout = std::str::from_utf8(stdout).context("systemctl output is not UTF-8")?;
     let mut properties = BTreeMap::new();
     for line in stdout.lines() {
         let (name, value) = line
@@ -348,6 +338,35 @@ fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
         );
     }
     Ok(properties)
+}
+
+fn should_retry_systemctl_discovery(properties: &BTreeMap<String, String>, attempt: usize) -> bool {
+    properties.get("LoadState").map(String::as_str) == Some("not-found")
+        && attempt + 1 < SYSTEMCTL_DISCOVERY_ATTEMPTS
+}
+
+fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
+    for attempt in 0..SYSTEMCTL_DISCOVERY_ATTEMPTS {
+        let output = Command::new("systemctl")
+            .args([
+                "show",
+                unit,
+                "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak",
+            ])
+            .output()
+            .with_context(|| format!("failed to run systemctl for {unit}"))?;
+        ensure!(
+            output.status.success(),
+            "systemctl failed for {unit}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+        let properties = parse_systemctl_properties(&output.stdout, unit)?;
+        if !should_retry_systemctl_discovery(&properties, attempt) {
+            return Ok(properties);
+        }
+        thread::sleep(SYSTEMCTL_DISCOVERY_RETRY_DELAY);
+    }
+    unreachable!("systemctl discovery loop always returns")
 }
 
 fn required_property<'a>(
@@ -796,5 +815,22 @@ mod tests {
         fs::write(&output, b"preserve me").unwrap();
         assert!(write_no_clobber(&output, &serde_json::json!({"new": true})).is_err());
         assert_eq!(fs::read(&output).unwrap(), b"preserve me");
+    }
+
+    #[test]
+    fn systemctl_property_parser_exposes_transient_not_found_state() {
+        let properties = parse_systemctl_properties(
+            b"LoadState=not-found\nActiveState=inactive\nInvocationID=\n",
+            "example.service",
+        )
+        .unwrap();
+        assert_eq!(
+            properties.get("LoadState").map(String::as_str),
+            Some("not-found")
+        );
+        assert_eq!(properties.get("InvocationID").map(String::as_str), Some(""));
+        assert!(should_retry_systemctl_discovery(&properties, 0));
+        assert!(should_retry_systemctl_discovery(&properties, 1));
+        assert!(!should_retry_systemctl_discovery(&properties, 2));
     }
 }
