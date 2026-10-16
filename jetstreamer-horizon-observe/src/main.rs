@@ -28,8 +28,8 @@ const CONFIG_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-config-v1"
 const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v1";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIOUS_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
-const SYSTEMCTL_DISCOVERY_ATTEMPTS: usize = 3;
-const SYSTEMCTL_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(100);
+const SYSTEMCTL_DISCOVERY_ATTEMPTS: usize = 11;
+const SYSTEMCTL_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -345,13 +345,59 @@ fn should_retry_systemctl_discovery(properties: &BTreeMap<String, String>, attem
         && attempt + 1 < SYSTEMCTL_DISCOVERY_ATTEMPTS
 }
 
+fn cgroup_belongs_to_system_unit(cgroup: &[u8], unit: &str) -> Result<bool> {
+    let cgroup = std::str::from_utf8(cgroup).context("process cgroup is not UTF-8")?;
+    let expected = format!("/system.slice/{unit}");
+    Ok(cgroup.lines().any(|line| {
+        line.rsplit_once(':')
+            .map(|(_, path)| path == expected)
+            .unwrap_or(false)
+    }))
+}
+
+fn systemctl_whoami_matches(stdout: &[u8], unit: &str) -> Result<bool> {
+    let stdout = std::str::from_utf8(stdout).context("systemctl whoami output is not UTF-8")?;
+    Ok(stdout.trim() == unit)
+}
+
+fn rediscover_systemctl_unit_via_cgroup(unit: &str) -> Result<bool> {
+    for entry in fs::read_dir("/proc").context("failed to read /proc for systemd discovery")? {
+        let entry = entry?;
+        let Some(pid) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+            continue;
+        }
+        let cgroup = match fs::read(entry.path().join("cgroup")) {
+            Ok(cgroup) => cgroup,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to read cgroup for process {pid}"));
+            }
+        };
+        if !cgroup_belongs_to_system_unit(&cgroup, unit)? {
+            continue;
+        }
+        let output = Command::new("systemctl")
+            .args(["whoami", &pid])
+            .output()
+            .with_context(|| format!("failed to rediscover {unit} through process {pid}"))?;
+        if output.status.success() && systemctl_whoami_matches(&output.stdout, unit)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
     for attempt in 0..SYSTEMCTL_DISCOVERY_ATTEMPTS {
         let output = Command::new("systemctl")
             .args([
                 "show",
                 unit,
-                "--property=LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak",
+                "--property=Id,LoadState,ActiveState,SubState,Result,MainPID,InvocationID,NRestarts,MemoryCurrent,MemoryPeak",
             ])
             .output()
             .with_context(|| format!("failed to run systemctl for {unit}"))?;
@@ -362,8 +408,19 @@ fn systemctl_properties(unit: &str) -> Result<BTreeMap<String, String>> {
         );
         let properties = parse_systemctl_properties(&output.stdout, unit)?;
         if !should_retry_systemctl_discovery(&properties, attempt) {
+            if properties.get("LoadState").map(String::as_str) != Some("not-found") {
+                ensure!(
+                    required_property(&properties, "Id", unit)? == unit,
+                    "systemctl returned a different unit while observing {unit}"
+                );
+            }
             return Ok(properties);
         }
+        // A transient service can remain alive in its exact cgroup while a
+        // name-based systemd lookup briefly reports LoadState=not-found.
+        // Querying the manager by a PID from that exact cgroup refreshes unit
+        // discovery without signaling or otherwise changing the service.
+        let _ = rediscover_systemctl_unit_via_cgroup(unit)?;
         thread::sleep(SYSTEMCTL_DISCOVERY_RETRY_DELAY);
     }
     unreachable!("systemctl discovery loop always returns")
@@ -830,7 +887,34 @@ mod tests {
         );
         assert_eq!(properties.get("InvocationID").map(String::as_str), Some(""));
         assert!(should_retry_systemctl_discovery(&properties, 0));
-        assert!(should_retry_systemctl_discovery(&properties, 1));
-        assert!(!should_retry_systemctl_discovery(&properties, 2));
+        assert!(should_retry_systemctl_discovery(&properties, 9));
+        assert!(!should_retry_systemctl_discovery(&properties, 10));
+    }
+
+    #[test]
+    fn cgroup_discovery_requires_the_exact_system_service() {
+        let unit = "jetstreamer-example.service";
+        assert!(
+            cgroup_belongs_to_system_unit(b"0::/system.slice/jetstreamer-example.service\n", unit,)
+                .unwrap()
+        );
+        assert!(
+            !cgroup_belongs_to_system_unit(
+                b"0::/system.slice/jetstreamer-example.service-child\n",
+                unit,
+            )
+            .unwrap()
+        );
+        assert!(
+            !cgroup_belongs_to_system_unit(b"0::/user.slice/jetstreamer-example.service\n", unit,)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn pid_discovery_requires_exact_systemctl_identity() {
+        let unit = "jetstreamer-example.service";
+        assert!(systemctl_whoami_matches(b"jetstreamer-example.service\n", unit).unwrap());
+        assert!(!systemctl_whoami_matches(b"jetstreamer-other.service\n", unit).unwrap());
     }
 }
