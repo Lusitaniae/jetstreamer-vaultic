@@ -725,7 +725,7 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         "package receipt path is not canonical for the epoch"
     );
     let expected_probe_root = format!(
-        "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v2",
+        "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v3",
         plan.epoch
     );
     ensure!(
@@ -1021,7 +1021,7 @@ mod tests {
             snapshot_sha256: "3".repeat(64),
             checkpoint_name: "epoch-hashes-209-complete-span.txt".to_string(),
             checkpoint_sha256: "4".repeat(64),
-            probe_root: "/home/ubuntu/.jetstreamer-private/qualification-209/package-capability-probe-rust-ca2e38b-v2".into(),
+            probe_root: "/home/ubuntu/.jetstreamer-private/qualification-209/package-capability-probe-rust-ca2e38b-v3".into(),
             receipt: "/home/ubuntu/.jetstreamer-private/campaign-state/epoch209-complete-span-package-capability-ca2e38b-rust-20261016-v1.json".into(),
             run_uid: 1000,
             run_gid: 1000,
