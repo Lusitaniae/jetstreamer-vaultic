@@ -70,6 +70,13 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   skipping it. Accept either one epoch or an inclusive `START-END` range when the user supplies a
   bound. Do not ask for a range merely because it was omitted.
 - Locate the Jetstreamer repository and read its current historical compatibility table and active controller state before starting generation.
+- Before selecting initial replay concurrency, replacing a completed lane, or increasing the host's
+  proven lane count, read [references/host-utilization.md](references/host-utilization.md). Operate
+  work-conservingly inside the safety envelope: keep the next disjoint candidate staged, promptly
+  backfill cleanly completed capacity up to the last proven operating point after fresh admission,
+  and treat an otherwise admissible idle lane as a condition to explain and resolve. Increasing
+  beyond the proven point remains a one-lane experiment requiring a clean coordinated sample at
+  least 1,800 seconds after the preceding routine sample.
 - Plan missing work as ordered contiguous cohorts before falling back to singleton epochs. Adjacent
   epochs that share an immutable runtime and checkpoint chain should run sequentially in one
   persistent generation, carrying the same live runtime state and AccountsDb scratch forward across
