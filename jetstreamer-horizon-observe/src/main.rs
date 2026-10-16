@@ -30,6 +30,44 @@ const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIOUS_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
 const SYSTEMCTL_DISCOVERY_ATTEMPTS: usize = 11;
 const SYSTEMCTL_DISCOVERY_RETRY_DELAY: Duration = Duration::from_millis(500);
+const MONOTONIC_MEMORY_STAT_COUNTERS: &[&str] = &[
+    "numa_pages_migrated",
+    "numa_pte_updates",
+    "numa_hint_faults",
+    "pgactivate",
+    "pgdeactivate",
+    "pgdemote_direct",
+    "pgdemote_khugepaged",
+    "pgdemote_kswapd",
+    "pgfault",
+    "pglazyfree",
+    "pglazyfreed",
+    "pgmajfault",
+    "pgpromote_success",
+    "pgrefill",
+    "pgscan_direct",
+    "pgscan_khugepaged",
+    "pgscan_kswapd",
+    "pgsteal_direct",
+    "pgsteal_khugepaged",
+    "pgsteal_kswapd",
+    "swpin_zero",
+    "swpout_zero",
+    "thp_collapse_alloc",
+    "thp_fault_alloc",
+    "thp_swpout",
+    "thp_swpout_fallback",
+    "workingset_activate_anon",
+    "workingset_activate_file",
+    "workingset_nodereclaim",
+    "workingset_refault_anon",
+    "workingset_refault_file",
+    "workingset_restore_anon",
+    "workingset_restore_file",
+    "zswpin",
+    "zswpout",
+    "zswpwb",
+];
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -644,20 +682,37 @@ fn parse_io_stat(path: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(counters)
 }
 
+fn split_memory_stat(
+    values: BTreeMap<String, u64>,
+) -> (BTreeMap<String, Option<u64>>, BTreeMap<String, u64>) {
+    let mut gauges = BTreeMap::new();
+    let mut counters = BTreeMap::new();
+    for (name, value) in values {
+        let field = name
+            .strip_prefix("memory_stat.")
+            .expect("memory.stat parser applies the prefix");
+        gauges.insert(name.clone(), Some(value));
+        if MONOTONIC_MEMORY_STAT_COUNTERS.contains(&field) {
+            counters.insert(name, value);
+        }
+    }
+    (gauges, counters)
+}
+
 fn observe_cgroup(control_group: &str) -> Result<CgroupObservation> {
     let path = resolve_cgroup(control_group)?;
     let mut gauges = BTreeMap::new();
     for name in ["memory.current", "memory.peak", "pids.current", "pids.peak"] {
         gauges.insert(name.to_owned(), parse_integer_file(&path.join(name))?);
     }
+    let memory_stat = parse_counter_file(&path.join("memory.stat"), "memory_stat")?;
+    let (memory_stat_gauges, memory_stat_counters) = split_memory_stat(memory_stat);
+    gauges.extend(memory_stat_gauges);
     let mut counters = BTreeMap::new();
-    for (filename, prefix) in [
-        ("cpu.stat", "cpu"),
-        ("memory.stat", "memory_stat"),
-        ("memory.events", "memory_events"),
-    ] {
+    for (filename, prefix) in [("cpu.stat", "cpu"), ("memory.events", "memory_events")] {
         counters.extend(parse_counter_file(&path.join(filename), prefix)?);
     }
+    counters.extend(memory_stat_counters);
     for (filename, prefix) in [
         ("cpu.pressure", "cpu_pressure"),
         ("memory.pressure", "memory_pressure"),
@@ -1501,7 +1556,7 @@ mod tests {
         let memory = directory.path().join("memory.stat");
         let pressure = directory.path().join("memory.pressure");
         let io = directory.path().join("io.stat");
-        fs::write(&memory, "anon 12\npgmajfault 7\n").unwrap();
+        fs::write(&memory, "anon 12\nactive_anon 9\npgmajfault 7\n").unwrap();
         fs::write(
             &pressure,
             "some avg10=0.00 avg60=0.01 avg300=0.02 total=41\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=3\n",
@@ -1513,9 +1568,13 @@ mod tests {
         )
         .unwrap();
         let memory = parse_counter_file(&memory, "memory_stat").unwrap();
+        let (memory_gauges, memory_counters) = split_memory_stat(memory);
         let pressure = parse_pressure_file(&pressure, "memory_pressure").unwrap();
         let io = parse_io_stat(&io).unwrap();
-        assert_eq!(memory["memory_stat.pgmajfault"], 7);
+        assert_eq!(memory_gauges["memory_stat.active_anon"], Some(9));
+        assert_eq!(memory_gauges["memory_stat.pgmajfault"], Some(7));
+        assert!(!memory_counters.contains_key("memory_stat.active_anon"));
+        assert_eq!(memory_counters["memory_stat.pgmajfault"], 7);
         assert_eq!(pressure["memory_pressure.some_total_usec"], 41);
         assert_eq!(pressure["memory_pressure.full_total_usec"], 3);
         assert_eq!(io["io.rbytes"], 40);
