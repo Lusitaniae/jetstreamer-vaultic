@@ -142,7 +142,7 @@ def check_expected_unit(state: UnitState, spec: object) -> None:
 
 
 def parse_mode(value: object, context: str) -> int:
-    if not isinstance(value, str) or re.fullmatch(r"0[0-7]{3}", value) is None:
+    if not isinstance(value, str) or re.fullmatch(r"[0-7]{4}", value) is None:
         raise AdmissionError(f"{context} mode must be four octal digits")
     return int(value, 8)
 

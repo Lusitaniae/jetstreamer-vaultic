@@ -20,6 +20,16 @@ def unit(**overrides: object) -> admission.UnitState:
 
 
 class HistoricalPerformanceAdmissionTest(unittest.TestCase):
+    def test_parse_mode_accepts_special_bits_and_rejects_noncanonical_text(self) -> None:
+        self.assertEqual(admission.parse_mode("0400", "file"), 0o400)
+        self.assertEqual(admission.parse_mode("3770", "directory"), 0o3770)
+        for value in ("770", "03770", "0888", 0o770):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    admission.AdmissionError, "four octal digits"
+                ):
+                    admission.parse_mode(value, "artifact")
+
     def test_terminal_and_absent_unit_gates_are_strict(self) -> None:
         admission.check_terminal_unit(unit())
         with self.assertRaises(admission.AdmissionError):
