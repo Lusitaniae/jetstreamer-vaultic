@@ -33,6 +33,8 @@ struct Arguments {
 struct Model {
     schema: String,
     sample_target_utc: String,
+    phase: String,
+    status_receipt_directory: PathBuf,
     evidence: Vec<Evidence>,
     rounding: String,
     ranges: Vec<RangeModel>,
@@ -123,6 +125,8 @@ struct Output {
     model_path: String,
     model_sha256: String,
     estimator_sha256: String,
+    phase: String,
+    status_receipt_directory: String,
     ranges: Vec<RangeOutput>,
     estimates: Vec<EpochEstimate>,
     mutations: Mutations,
@@ -270,6 +274,11 @@ fn read_exact(path: &Path, expected_sha256: &str, immutable_root_owned: bool) ->
 
 fn validate_model(model: &Model) -> Result<()> {
     ensure!(model.schema == MODEL_SCHEMA, "model schema mismatch");
+    ensure!(model.phase == "replay", "model phase mismatch");
+    ensure!(
+        model.status_receipt_directory.is_absolute(),
+        "status receipt directory is not absolute"
+    );
     ensure!(
         model.rounding
             == "round each estimated total to the nearest whole second, then multiply by 1000",
@@ -503,6 +512,17 @@ fn run() -> Result<()> {
     let observer: Observer =
         serde_json::from_slice(&observer_bytes).context("invalid observer JSON")?;
     validate_model(&model)?;
+    ensure!(
+        model.status_receipt_directory.canonicalize()? == model.status_receipt_directory,
+        "status receipt directory path is not exact"
+    );
+    let receipt_directory_metadata = fs::symlink_metadata(&model.status_receipt_directory)?;
+    ensure!(
+        receipt_directory_metadata.is_dir()
+            && receipt_directory_metadata.uid() == 0
+            && receipt_directory_metadata.mode() & 0o7777 == 0o700,
+        "status receipt directory identity or mode mismatch"
+    );
     for evidence in &model.evidence {
         read_exact(&evidence.path, &evidence.sha256, false)
             .with_context(|| format!("model evidence failed: {}", evidence.path.display()))?;
@@ -553,6 +573,8 @@ fn run() -> Result<()> {
         model_path: arguments.model.display().to_string(),
         model_sha256: arguments.model_sha256,
         estimator_sha256: arguments.self_sha256,
+        phase: model.phase,
+        status_receipt_directory: model.status_receipt_directory.display().to_string(),
         ranges,
         estimates,
         mutations: Mutations {
