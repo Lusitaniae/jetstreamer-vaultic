@@ -718,6 +718,19 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   replay can begin at `bootstrap_slot + 1` while recorded output begins at the epoch boundary.
   Independently check that `terminal_slot - output_slot_start + 1` equals the manifest's
   `output_slot_count`, and launch a distinct non-restarting attempt if an expectation was wrong.
+- Before capability-probing or launching a newly sealed complete-span focused package, attest it
+  with the reviewed Rust `jetstreamer-focused-package-attest` binary. Seal the binary together with
+  a separately hash-bound, root-owned immutable plan and invoke it with both the exact plan and
+  executable SHA-256 values. It must validate the deployment-seal receipt, require the package's
+  actual member set to equal `SHA256SUMS`, independently hash every member, bind the complete-span
+  manifest and all non-authorizing stop gates, prove the packaged bootstrap is a distinct inode
+  from the retained source, and pass its sealed free-space threshold before writing a no-clobber
+  private package receipt. A threshold rejection is a clean failed attestation: preserve the
+  package, write no receipt, and retry only after later coordinated resource evidence establishes
+  enough free space. The package receipt never authorizes replay, plugin verification,
+  publication, or R2 mutation; the exact-package capability probe and fresh admission remain
+  independent requirements. Do not extend the older Python package-layout helper for a new sealed
+  deployment.
 - Before spending a full archive scan on the current per-epoch plugin, also compare the segment
   manifest's output start, terminal slot, and count with that epoch's complete canonical slot
   range. A focused checkpoint artifact that starts at the epoch boundary but stops even one slot
