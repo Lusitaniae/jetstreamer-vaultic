@@ -973,6 +973,7 @@ def producer_environment(
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
     solana_rayon_threads: int | None = None,
+    historical_trace: bool = False,
 ) -> tuple[str, ...]:
     producer_path = (
         DEFAULT_PRODUCER_PATH
@@ -998,6 +999,7 @@ def producer_environment(
             if solana_rayon_threads is not None
             else ()
         ),
+        *(("JETSTREAMER_HISTORICAL_TRACE=1",) if historical_trace else ()),
         "JETSTREAMER_HISTORICAL_POH_THREADS=10",
         # Old Banks can retain tens of GiB of private account state.  The
         # worker acknowledges Shutdown only after replay and checkpoint work
@@ -1043,6 +1045,7 @@ def build_producer_command(
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
     solana_rayon_threads: int | None = None,
+    historical_trace: bool = False,
     cohort_bootstrap: Path | None = None,
 ) -> list[str]:
     node = deploy / "jetstreamer-node"
@@ -1117,6 +1120,7 @@ def build_producer_command(
             producer_home,
             gcloud_bin,
             solana_rayon_threads,
+            historical_trace,
         )
     )
     command.extend(
@@ -1629,6 +1633,7 @@ def unit_is_hardened_for_adoption(
     producer_home: Path = Path("/home/sol"),
     gcloud_bin: Path | None = None,
     solana_rayon_threads: int | None = None,
+    historical_trace: bool = False,
 ) -> bool:
     properties = systemd_properties(
         unit,
@@ -1771,6 +1776,7 @@ def unit_is_hardened_for_adoption(
             producer_home,
             gcloud_bin,
             solana_rayon_threads,
+            historical_trace,
         )
     )
     if configured_environment != expected_environment:
@@ -3499,6 +3505,7 @@ class Controller:
             self.producer_home,
             self.args.gcloud_bin,
             self.args.solana_rayon_threads,
+            self.args.historical_trace,
         ):
             raise SweepError(
                 f"matching producer PID {process.pid} for cohort {cohort.label} "
@@ -3803,6 +3810,7 @@ class Controller:
             producer_home=self.producer_home,
             gcloud_bin=self.args.gcloud_bin,
             solana_rayon_threads=self.args.solana_rayon_threads,
+            historical_trace=self.args.historical_trace,
             cohort_bootstrap=cohort_bootstrap,
         )
         self.revalidate_operational_directories()
@@ -4406,6 +4414,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "same-snapshot performance qualification"
         ),
     )
+    parser.add_argument(
+        "--historical-trace",
+        action="store_true",
+        help=(
+            "enable the historical worker's diagnostic trace environment for "
+            "an isolated replay generation"
+        ),
+    )
     parser.add_argument("--gcloud-account", default=DEFAULT_ACCOUNT)
     parser.add_argument("--gcloud-project", default=DEFAULT_PROJECT)
     parser.add_argument(
@@ -4748,6 +4764,7 @@ def print_plan(
             for unit, binding in sorted(args.external_disk_growth_claim_gib.items())
         },
         "solana_rayon_threads": args.solana_rayon_threads,
+        "historical_trace": args.historical_trace,
         "r2_receipt_directory": (
             str(args.r2_receipt_directory)
             if args.r2_receipt_directory is not None

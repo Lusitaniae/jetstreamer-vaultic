@@ -2224,6 +2224,26 @@ mod tests {
     }
 
     #[test]
+    fn epoch_224_mismatch_vote_fixture_decodes_exactly() {
+        let data = bs58::decode(
+            "2ZjTR1vUs2pHXyTLvTMD8QCMYFMWeoVf5YQso54cGotg2fhzMpFJoDSyyAXHHuuUsgoNuKfXguCbno2S8gw",
+        )
+        .into_vec()
+        .unwrap();
+        let instruction: VoteInstruction = bincode::deserialize(&data).unwrap();
+        match instruction {
+            VoteInstruction::Vote(vote) => {
+                assert_eq!(vote.slots, vec![96_767_525]);
+                assert_eq!(
+                    vote.hash.to_string(),
+                    "Gebqm3dzs8Lhwe3giMWH5wjLXzGd5z5ZoEoZKtnFDQCX"
+                );
+            }
+            other => panic!("unexpected vote instruction: {:?}", other),
+        }
+    }
+
+    #[test]
     #[ignore]
     fn initializes_and_checkpoints_v1_6_20_boundary_snapshot() {
         let archive = std::env::var("JETSTREAMER_SNAPSHOT_93311535")

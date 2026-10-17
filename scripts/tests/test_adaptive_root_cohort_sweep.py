@@ -893,6 +893,40 @@ class CommandTests(unittest.TestCase):
             f"PATH={gcloud.parent}:{sweep.DEFAULT_PRODUCER_PATH}", environment
         )
 
+    def test_historical_trace_is_explicit_and_diagnostic_only(self) -> None:
+        common = {
+            "cohort": self.cohort,
+            "lane": self.lane,
+            "deploy": self.deploy,
+            "manifest": self.manifest,
+            "fingerprint": self.fingerprint,
+        }
+        ordinary = sweep.build_producer_command(
+            unit="producer-ordinary.service",
+            **common,
+        )
+        diagnostic = sweep.build_producer_command(
+            unit="producer-diagnostic.service",
+            historical_trace=True,
+            **common,
+        )
+
+        ordinary_environment = {
+            item.removeprefix("--setenv=")
+            for item in ordinary
+            if item.startswith("--setenv=")
+        }
+        diagnostic_environment = {
+            item.removeprefix("--setenv=")
+            for item in diagnostic
+            if item.startswith("--setenv=")
+        }
+        self.assertNotIn("JETSTREAMER_HISTORICAL_TRACE=1", ordinary_environment)
+        self.assertEqual(
+            diagnostic_environment - ordinary_environment,
+            {"JETSTREAMER_HISTORICAL_TRACE=1"},
+        )
+
     def test_gcloud_bin_is_resolved_and_must_be_executable(self) -> None:
         parser = sweep.build_argument_parser()
         with tempfile.TemporaryDirectory() as raw:
