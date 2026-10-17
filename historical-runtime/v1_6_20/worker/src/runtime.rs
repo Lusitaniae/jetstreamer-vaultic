@@ -147,7 +147,8 @@ impl RuntimeState {
         initial_state: &jetstreamer_historical_protocol::InitialState,
         scratch_root: Option<&str>,
     ) -> Result<(Self, Initialized), String> {
-        let diagnostic_singleton_execution = configured_diagnostic_singleton_execution()?;
+        let diagnostic_singleton_execution =
+            diagnostic_singleton_execution_enabled(configured_diagnostic_singleton_execution()?);
         if diagnostic_singleton_execution {
             if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_none() {
                 return Err(format!(
@@ -1131,6 +1132,10 @@ fn configured_diagnostic_singleton_execution() -> Result<bool, String> {
     }
 }
 
+fn diagnostic_singleton_execution_enabled(environment_override: bool) -> bool {
+    cfg!(feature = "diagnostic-singleton") || environment_override
+}
+
 fn singleton_transaction_waves(transaction_count: usize) -> Vec<Range<usize>> {
     (0..transaction_count)
         .map(|index| index..index + 1)
@@ -1405,6 +1410,15 @@ mod tests {
         assert!(parse_diagnostic_singleton_execution(Some("0")).is_err());
         assert!(parse_diagnostic_singleton_execution(Some("true")).is_err());
         assert!(parse_diagnostic_singleton_execution(Some("")).is_err());
+    }
+
+    #[test]
+    fn diagnostic_singleton_build_mode_is_explicit() {
+        assert_eq!(
+            diagnostic_singleton_execution_enabled(false),
+            cfg!(feature = "diagnostic-singleton")
+        );
+        assert!(diagnostic_singleton_execution_enabled(true));
     }
 
     #[test]
