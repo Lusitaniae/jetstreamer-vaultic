@@ -115,7 +115,7 @@
 //! | `JETSTREAMER_NETWORK_CAPACITY_MB` | `1000` | Assumed network throughput in megabytes per second used when auto-sizing firehose thread counts. |
 //! | `JETSTREAMER_SPAWN_PENDING` | `4` (`24` with `--turbo`) | Maximum not-yet-green threads in flight during the health-gated thread ramp; `1` reproduces a strict one-at-a-time ramp. |
 //! | `JETSTREAMER_SPAWN_GRACE_SECS` | `30` | How long the launch gate waits for sluggish (never stalled) threads before spawning anyway; `0` disables launch gating entirely. |
-//! | `JETSTREAMER_RECYCLE_PCT` | `0` (`50` with `--turbo`) | Connection-recycle threshold as a percent of the best observed p90 per-thread rate; threads persistently below it reconnect. `0` disables recycling. |
+//! | `JETSTREAMER_RECYCLE_PCT` | `50` | Connection-recycle threshold as a percent of the best observed p90 per-thread rate; threads persistently below it reconnect. `0` disables recycling. |
 //!
 //! Changing the network automatically segregates cache entries, allowing you to toggle between
 //! clusters without purging state.
@@ -341,9 +341,9 @@ fn parse_clickhouse_mode(value: &str) -> Option<ClickhouseMode> {
 /// ## Polite and turbo pace
 ///
 /// By default the runner is polite to the shared Old Faithful archive: it spaces new
-/// connections 250 ms apart, does not recycle slow connections, and backs off up to 120 s after
-/// a failure. Benchmarks such as the 2.7M TPS run use [`JetstreamerRunner::with_turbo`] (or
-/// `--turbo`), preferably against a private mirror. See [`firehose::pace::Pace`].
+/// connections 250 ms apart, recycles slow connections every 2 min, and backs off up to 120 s
+/// after a failure. Benchmarks such as the 2.7M TPS run use [`JetstreamerRunner::with_turbo`]
+/// (or `--turbo`), preferably against a private mirror. See [`firehose::pace::Pace`].
 pub struct JetstreamerRunner {
     log_level: String,
     plugins: Vec<Box<dyn Plugin>>,
@@ -434,9 +434,9 @@ impl JetstreamerRunner {
 
     /// Runs at full speed ([`Pace::Turbo`]) instead of the polite default ([`Pace::Polite`]).
     ///
-    /// Turbo spaces new connections 15 ms apart instead of 250 ms, recycles slow connections,
-    /// and caps the restart backoff at 32 s instead of 120 s. Use it for benchmarks and private
-    /// mirrors, not for routine runs against the public archive.
+    /// Turbo spaces new connections 15 ms apart instead of 250 ms, recycles slow connections
+    /// every 15 s instead of every 2 min, and caps the restart backoff at 32 s instead of 120 s.
+    /// Use it for benchmarks and private mirrors, not for routine runs against the public archive.
     pub const fn with_turbo(mut self, turbo: bool) -> Self {
         self.config.turbo = turbo;
         self
@@ -1033,8 +1033,9 @@ fn parse_env_bool(key: &str, default: bool) -> bool {
 fn log_pace(pace: Pace) {
     match pace {
         Pace::Polite => log::info!(
-            "polite pace: new connections at least {:?} apart, connection recycling off; pass --turbo to run at full speed",
-            pace.request_spacing()
+            "polite pace: new connections at least {:?} apart, connection recycling every {:?}; pass --turbo to run at full speed",
+            pace.request_spacing(),
+            pace.recycle_interval()
         ),
         Pace::Turbo if car_location().url().as_str().starts_with(BASE_URL) => log::warn!(
             "turbo pace against the public archive at {}; use a private mirror for benchmarks",

@@ -19,14 +19,14 @@ static PACE: AtomicU8 = AtomicU8::new(UNSET);
 /// | Setting | Polite | Turbo |
 /// |---------|--------|-------|
 /// | [`Pace::request_spacing`] | 250 ms | 15 ms |
-/// | [`Pace::default_recycle_pct`] | 0 (off) | 50 |
+/// | [`Pace::recycle_interval`] | 2 min | 15 s |
 /// | [`Pace::default_spawn_pending`] | 4 | 24 |
 /// | [`Pace::retry_backoff_base`] .. [`Pace::retry_backoff_max`] | 2 s .. 120 s | 1 s .. 32 s |
 ///
-/// `JETSTREAMER_RECYCLE_PCT` and `JETSTREAMER_SPAWN_PENDING` still override the defaults.
+/// `JETSTREAMER_SPAWN_PENDING` still overrides the default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pace {
-    /// Paced reconnects, no connection recycling and a slow restart backoff.
+    /// Paced reconnects, rare connection recycling and a slow restart backoff.
     #[default]
     Polite,
     /// Fast reconnects, connection recycling and a short restart backoff.
@@ -42,11 +42,11 @@ impl Pace {
         }
     }
 
-    /// Default connection-recycle threshold when `JETSTREAMER_RECYCLE_PCT` is unset.
-    pub const fn default_recycle_pct(self) -> u64 {
+    /// Time between connection-recycle sweeps. Each sweep reconnects the slowest threads.
+    pub const fn recycle_interval(self) -> Duration {
         match self {
-            Self::Polite => 0,
-            Self::Turbo => 50,
+            Self::Polite => Duration::from_secs(120),
+            Self::Turbo => Duration::from_secs(15),
         }
     }
 
@@ -140,15 +140,15 @@ mod tests {
     fn polite_is_slower_than_turbo_on_every_setting() {
         let (polite, turbo) = (Pace::Polite, Pace::Turbo);
         assert!(polite.request_spacing() > turbo.request_spacing());
-        assert!(polite.default_recycle_pct() < turbo.default_recycle_pct());
+        assert!(polite.recycle_interval() > turbo.recycle_interval());
         assert!(polite.default_spawn_pending() < turbo.default_spawn_pending());
         assert!(polite.retry_backoff_base() > turbo.retry_backoff_base());
         assert!(polite.retry_backoff_max() > turbo.retry_backoff_max());
     }
 
     #[test]
-    fn polite_disables_connection_recycling() {
-        assert_eq!(Pace::Polite.default_recycle_pct(), 0);
+    fn polite_recycles_less_often_than_every_15_s() {
+        assert!(Pace::Polite.recycle_interval() > Duration::from_secs(15));
     }
 
     #[test]

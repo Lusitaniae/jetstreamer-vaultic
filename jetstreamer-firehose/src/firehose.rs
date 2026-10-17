@@ -236,13 +236,13 @@ const SPAWN_GRACE_DEFAULT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Recycle threshold as a percent of the fastest thread's current rate: threads persistently
 /// below it restart their connection to shed a throughput-clamped one. Override with
-/// `JETSTREAMER_RECYCLE_PCT`; `0` disables recycling. The default comes from the [`pace`].
+/// `JETSTREAMER_RECYCLE_PCT`; `0` disables recycling.
 fn recycle_threshold_pct() -> u64 {
     std::env::var("JETSTREAMER_RECYCLE_PCT")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
         .map(|pct| pct.min(100))
-        .unwrap_or_else(|| pace().default_recycle_pct())
+        .unwrap_or(50)
 }
 
 /// Maximum number of running-but-not-yet-green threads the launch gate allows before pausing
@@ -1540,7 +1540,7 @@ where
     let recycle_monitor = (recycle_pct > 0 && !sequential && thread_total > 1).then(|| {
         let shutdown_flag = shutdown_flag.clone();
         tokio::spawn(async move {
-            const SWEEP: std::time::Duration = std::time::Duration::from_secs(15);
+            let sweep = pace().recycle_interval();
             const MIN_STREAM_AGE_MS: u64 = 30_000;
             /// Rolling rotation, not a storm: a uniform clamp puts most of the fleet under
             /// the threshold at once, and recycling everyone simultaneously would zero
@@ -1554,7 +1554,7 @@ where
             // the bar — one anomalously fast thread can't set it.
             let mut reference: u64 = 0;
             loop {
-                sleep(SWEEP).await;
+                sleep(sweep).await;
                 if shutdown_flag.load(Ordering::SeqCst) {
                     return;
                 }
