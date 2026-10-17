@@ -936,10 +936,15 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 - Do not treat a sidecar alone as proof that the archive was uploaded.
 - Resume idempotently from R2 inventory and private receipts after interruption.
 - Leave exactly one normal 30-minute observation cadence for each running job, singleton, legacy
-  cohort, or durable watcher. Use that same identity-stable observation to refresh every claimed
-  epoch's `epoch-N.epoch-status.json`; do not poll separately for the table or for R2 metadata.
-  After arming a persistent timer or watcher, do not poll it in short empty loops or emit repeated
-  no-change status turns. Let it run unattended and inspect it once the cadence interval has elapsed
-  or its scheduled event should have completed. This cadence conserves operator/model tokens as well
-  as host and API work. Diagnose an observed failure or answer an explicit operator status request
-  immediately, but do not use either as a reason to restart or duplicate healthy work.
+  cohort, or durable watcher. Enforce 1,800 seconds as a hard minimum between autonomous routine
+  replay/resource observations; do not manually poll inside that window without a user request.
+  Use that same identity-stable observation to refresh every claimed epoch's
+  `epoch-N.epoch-status.json`; do not poll separately for the table or for R2 metadata. After arming
+  a persistent timer or watcher, do not poll it in short empty loops or emit repeated no-change
+  status turns. Let it run unattended and inspect it once the cadence interval has elapsed or its
+  scheduled event should have completed. A user request for a status update always authorizes one
+  immediate out-of-band replay/resource observation, even inside the normal 30-minute window; mark
+  it as user-requested in the resulting evidence and use it to refresh the status objects. Do not
+  turn that exception into an autonomous retry loop or additional unrequested polls. Diagnose an
+  already-observed failure from existing evidence, but do not use it as a reason to restart or
+  duplicate healthy work.
