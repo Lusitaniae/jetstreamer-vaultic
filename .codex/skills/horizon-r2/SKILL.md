@@ -138,7 +138,13 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   stable live identities and sufficient slot rates, and fsync a private no-clobber estimate receipt.
   Pass only the resulting integer millisecond values to the matching status publications. A missing
   rate, identity change, stale timestamp, model mismatch, or estimator failure publishes no
-  replacement status object; never substitute hand arithmetic after that fail-closed result.
+  replacement status object for the affected range; never substitute hand arithmetic after that
+  fail-closed result. When one observed range lacks rates but another remains healthy, a reviewed
+  schema-v3 partial model may estimate only the healthy range with the same previously validated
+  legacy formula. It must bind the complete observer range census, all current invocation IDs, the
+  root-owned owner-only estimate directory, prior estimate receipts that reproduce the formula, and
+  the exact coordinated observer receipt. Leave every excluded range's status objects unchanged;
+  never weaken the census or relabel a post-replay range as rate-bearing merely to refresh it.
 - Delete only that epoch's `epoch-N.epoch-status.json`, and only after the canonical `.jet` has been
   uploaded and read back, its `.sha256` sidecar has been created, and the complete pair has durable
   authenticated verification evidence. Status deletion does not wait for an anonymous public
