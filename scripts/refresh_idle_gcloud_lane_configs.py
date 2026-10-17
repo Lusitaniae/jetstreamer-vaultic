@@ -106,7 +106,7 @@ def sha256_descriptor(descriptor: int) -> str:
     return digest.hexdigest()
 
 
-def tree_summary(path: Path) -> dict[str, Any]:
+def tree_summary(path: Path, *, allow_empty: bool = False) -> dict[str, Any]:
     expected_root = exact_directory(path, "configuration tree")
     try:
         root_descriptor = os.open(
@@ -221,7 +221,7 @@ def tree_summary(path: Path) -> dict[str, Any]:
         final_root.st_mtime_ns,
     ) != (root.st_dev, root.st_ino, root.st_mtime_ns):
         raise RefreshError(f"configuration tree changed while scanning it: {path}")
-    if file_count == 0:
+    if file_count == 0 and not allow_empty:
         raise RefreshError(f"configuration tree contains no files: {path}")
     content_records = [
         {key: value for key, value in record.items() if key not in {"mode", "uid", "gid"}}
@@ -1288,7 +1288,13 @@ def build_preparation(plan_path: Path, plan_sha256: str, plan: dict[str, Any]) -
             "staged_config": lane["staged_config"],
             "backup_config": lane["backup_config"],
             "receipt": lane["receipt"],
-            "old_summary": tree_summary(Path(lane["effective_config"])),
+            # A newly staged dormant lane can legitimately have an empty
+            # configuration directory before its first credential install.
+            # Keep that empty identity fully bound so the atomic exchange and
+            # retained backup remain auditable.
+            "old_summary": tree_summary(
+                Path(lane["effective_config"]), allow_empty=True
+            ),
         })
     return {
         "schema": PREPARATION_SCHEMA,
@@ -1374,7 +1380,9 @@ def reset_pre_intent_paths(plan: dict[str, Any], preparation: dict[str, Any]) ->
             stat.S_IMODE(metadata.st_mode) != 0o700
             or metadata.st_uid != lane["uid"]
             or metadata.st_gid != lane["gid"]
-            or not same_content(tree_summary(effective), bound["old_summary"])
+            or not same_content(
+                tree_summary(effective, allow_empty=True), bound["old_summary"]
+            )
         ):
             raise RefreshError(f"effective configuration changed before exchange for {lane['label']}")
         for key in ("backup_config", "receipt"):
@@ -1535,7 +1543,7 @@ def install_lane(plan: dict[str, Any], plan_sha256: str, lane: dict[str, Any], b
     if receipt.exists() or receipt.is_symlink():
         payload = lane_receipt_matches(receipt, plan_sha256, plan, lane, bound)
         if backup.exists() or backup.is_symlink():
-            backup_summary = tree_summary(backup)
+            backup_summary = tree_summary(backup, allow_empty=True)
             if not same_tree_identity(backup_summary, bound["old_summary"]):
                 raise RefreshError(f"receipted backup identity changed for {lane['label']}")
             references = process_references(backup)
@@ -1547,11 +1555,11 @@ def install_lane(plan: dict[str, Any], plan_sha256: str, lane: dict[str, Any], b
             raise RefreshError(f"staging path remains after completed lane receipt: {staged}")
         return payload
     require_idle(plan["units"], (effective, staged, backup))
-    effective_summary = tree_summary(effective)
+    effective_summary = tree_summary(effective, allow_empty=True)
     staged_exists = staged.exists() or staged.is_symlink()
     backup_exists = backup.exists() or backup.is_symlink()
     if backup_exists:
-        backup_summary = tree_summary(backup)
+        backup_summary = tree_summary(backup, allow_empty=True)
         if not same_tree_identity(backup_summary, bound["old_summary"]):
             raise RefreshError(f"backup configuration changed for {lane['label']}")
         if (
@@ -1560,7 +1568,7 @@ def install_lane(plan: dict[str, Any], plan_sha256: str, lane: dict[str, Any], b
         ):
             raise RefreshError(f"invalid post-exchange path state for {lane['label']}")
     elif staged_exists:
-        staged_summary = tree_summary(staged)
+        staged_summary = tree_summary(staged, allow_empty=True)
         if (
             same_tree_identity(effective_summary, bound["old_summary"])
             and same_tree_identity(staged_summary, bound["staged_summary"])
@@ -1569,7 +1577,7 @@ def install_lane(plan: dict[str, Any], plan_sha256: str, lane: dict[str, Any], b
             rename_exchange(effective, staged)
             base.fsync_directory(effective.parent)
             base.fsync_directory(Path(plan["workspace"]["path"]))
-            exchanged_old = tree_summary(staged)
+            exchanged_old = tree_summary(staged, allow_empty=True)
             exchanged_new = tree_summary(effective)
             if (
                 not same_tree_identity(exchanged_old, bound["old_summary"])
@@ -1619,7 +1627,7 @@ def install_lane(plan: dict[str, Any], plan_sha256: str, lane: dict[str, Any], b
     references = process_references(backup)
     if references:
         raise RefreshError(f"live process references retained backup {backup}: {references}")
-    backup_summary = tree_summary(backup)
+    backup_summary = tree_summary(backup, allow_empty=True)
     if not same_tree_identity(backup_summary, bound["old_summary"]):
         raise RefreshError(f"backup identity changed after receipt for {lane['label']}")
     return payload
@@ -1674,7 +1682,9 @@ def validate_completion(
             raise RefreshError(f"refresh completion exists with a staged lane path for {lane['label']}")
         if not backup.exists() and not backup.is_symlink():
             raise RefreshError(f"refresh completion lacks the retained backup for {lane['label']}")
-        if not same_tree_identity(tree_summary(backup), bound["old_summary"]):
+        if not same_tree_identity(
+            tree_summary(backup, allow_empty=True), bound["old_summary"]
+        ):
             raise RefreshError(f"retained backup identity changed for {lane['label']}")
         expected_receipts.append({"path": str(path), "sha256": base.sha256_file(path)})
     if payload.get("lane_receipts") != expected_receipts:

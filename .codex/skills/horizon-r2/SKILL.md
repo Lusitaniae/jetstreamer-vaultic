@@ -5,7 +5,12 @@ description: Generate, verify, upload, and safely retire Horizon epoch archives 
 
 # Horizon R2
 
-Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects`. Aborting an incomplete multipart upload is allowed. Preserve an existing object by default. Overwrite an existing `.jet` only when positive verification evidence identifies that remote archive as erroneous and the user explicitly authorizes its replacement; a mismatch alone does not establish which copy is wrong.
+Treat R2 as durable storage. Never call `DeleteObject` or `DeleteObjects` except for the exact
+`epoch-N.epoch-status.json` lifecycle defined below. Never overwrite or delete a `.jet` or
+`.sha256` object as ordinary campaign work. Aborting an incomplete multipart upload is allowed.
+Preserve every other existing object by default. Overwrite an existing `.jet` only when positive
+verification evidence identifies that remote archive as erroneous and the user explicitly
+authorizes its replacement; a mismatch alone does not establish which copy is wrong.
 
 Cloudflare R2 public access is a bucket-level origin setting, not an S3 object ACL. R2 does not
 support `public-read`, `PutObjectAcl`, or the `x-amz-acl` upload header. Never claim that an object is
@@ -58,6 +63,77 @@ Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not
 
 For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust binary to discover newly completed local pairs and invoke the Rust uploader serially. Do not run two progressive uploaders over overlapping ranges. The coordinator never implements remote integrity checks or unlinks files itself. Upload requires digest-matching full-verification and current-plugin receipts. Optional local retirement additionally requires both adjacent-boundary receipts. This separation lets disjoint servers publish complete archives so a retired neighbor can be restored from R2 to close a cross-host boundary without circularly weakening retirement. The orchestrator requires the exact approved binary and verifier-script SHA-256 values, accepts explicit comma-separated binary- and script-hash allowlists during a pinned verifier transition, honors every `--defer-epochs` range for retirement, and then delegates remote verification plus optional local retirement to the Rust uploader. Retain `scripts/sync_horizon_r2_progressive.py` only for an already-sealed workflow when replacing it in place would invalidate evidence or destabilize active work; do not select it for a new deployment.
 
+### In-flight epoch status objects
+
+- Publish one mutable R2 object named `epoch-N.epoch-status.json` for every epoch currently claimed
+  by a live replay and not yet committed by its canonical `.sha256` sidecar. Keep these objects out
+  of `HORIZON_DIR`; build them in private state and publish them with reviewed Rust tooling. The
+  object is operational metadata, never an archive, verification receipt, lease, or publication
+  gate.
+- Use this JSON shape. The four numeric fields are mandatory JSON integers, never `null`, strings,
+  ranges, infinities, or omitted values. `sampled_at_utc` and `phase` make freshness and the estimate
+  basis explicit:
+
+  ```json
+  {
+    "epoch": 224,
+    "jet_size_bytes": 0,
+    "elapsed_execution_millis": 0,
+    "estimated_remaining_millis": 0,
+    "sampled_at_utc": "2026-10-17T00:40:00Z",
+    "phase": "replay"
+  }
+  ```
+
+- Bind `epoch` to the exact live claim. Measure `jet_size_bytes` from the current `.jet` regular
+  file and use `0` before that file exists. Derive `elapsed_execution_millis` from the authoritative
+  producer invocation start, not from the most recent poll. `estimated_remaining_millis` is the
+  current best definite estimate of wall time until the matching R2 `.sha256` sidecar appears. It
+  therefore includes remaining replay, archive close/fsync, independent full and plugin checks,
+  required boundary verification, upload, whole-object readback, source revalidation, and sidecar
+  commit. Use `0` only when the sidecar is already committed and the status object is awaiting its
+  final verified deletion.
+- Update every in-flight epoch's status exactly once per normal 30-minute replay observation, from
+  the same identity-stable sample and ETA model. Do not add a second polling loop. Require the bound
+  controller/producer invocation IDs and restart counts to remain stable across the sample; a
+  failed or identity-changing sample publishes no replacement. For a legacy multi-epoch replay,
+  publish a status object for every still-uncommitted epoch claimed by that replay, even when a
+  later member has not begun and its current size is `0`.
+- Status objects are the sole routine R2 mutation exception: later 30-minute samples may replace
+  only the matching `epoch-N.epoch-status.json`, preferably with an ETag/version precondition so an
+  older writer cannot replace a newer sample. Verify the exact uploaded bytes through authenticated
+  R2 readback. Status publication does not require `HORIZON_PUBLIC_BASE_URL` and does not wait for an
+  anonymous origin. Never let status-object permissions or failures weaken the archive/sidecar
+  gates.
+- Use the Rust uploader's `status-publish` command once per claimed epoch immediately after the
+  coordinated observer receipt is durable. Pass the exact directory containing that epoch's current
+  partial `.jet`; the command reports size `0` when the file has not begun. It verifies the observer
+  receipt SHA-256, stable zero-restart controller/producer IDs, and epoch claim, derives
+  `sampled_at_utc` from that receipt, conditionally creates or replaces only the canonical status
+  key, performs authenticated byte-for-byte readback, and fsyncs a private receipt:
+
+  ```sh
+  target/release/jetstreamer-r2 status-publish /absolute/current-jet-directory \
+    --epochs N-N \
+    --receipt-directory "$HOME/.jetstreamer-private/r2-status-receipts" \
+    --observer-receipt /absolute/horizon-live-resource-sample.json \
+    --observer-sha256 OBSERVER_SHA256 \
+    --expected-controller-invocation-id CONTROLLER_INVOCATION_ID \
+    --expected-producer-invocation-id PRODUCER_INVOCATION_ID \
+    --elapsed-execution-millis ELAPSED_MILLIS \
+    --estimated-remaining-millis REMAINING_MILLIS \
+    --phase replay
+  ```
+
+  This status command intentionally needs no public-origin environment setting. A failed observer
+  binding publishes nothing. Do not substitute a hand-written `put-object` command when publication
+  or authenticated readback fails.
+- Delete only that epoch's `epoch-N.epoch-status.json`, and only after the canonical `.jet` has been
+  uploaded and read back, its `.sha256` sidecar has been created, and the complete pair has durable
+  authenticated verification evidence. Status deletion does not wait for an anonymous public
+  origin. A missing status object is not archive completion evidence. Never use this exception to
+  delete or overwrite any `.jet`, `.sha256`, receipt, or differently named R2 object.
+
 ## Resolve the work
 
 - On a fresh host, or whenever any requested epoch is outside the checked-in runtime registry,
@@ -77,17 +153,28 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   and treat an otherwise admissible idle lane as a condition to explain and resolve. Increasing
   beyond the proven point remains a one-lane experiment requiring a clean coordinated sample at
   least 1,800 seconds after the preceding routine sample.
-- Plan missing work as ordered contiguous cohorts before falling back to singleton epochs. Adjacent
-  epochs that share an immutable runtime and checkpoint chain should run sequentially in one
-  persistent generation, carrying the same live runtime state and AccountsDb scratch forward across
-  epoch boundaries. Do not implement such a cohort as adjacent independent units, and do not budget,
-  restore, reinitialize, or clean its scratch as if each member were an independent replay. Apply
-  the detailed cohort boundaries and publication gates in **Produce and verify**. When generating a
-  fresh preflight manifest for compatible missing work, explicitly pass
-  `--target-cohort-epochs=3` or `--target-cohort-epochs=4`; the preflight command's default of one
-  epoch preserves legacy behavior and does not implement this preference. Confirm the resulting
-  fingerprinted manifest actually contains the intended multi-epoch cohorts before sealing a
-  controller.
+- Define the filesystem safety floor for a campaign century from resulting `.jet` sizes, not from
+  snapshots, replay scratch, or a fixed multi-terabyte constant. For the current century use epochs
+  200 through 300 inclusive. Select each epoch at most once and include only canonical complete
+  `.jet` lengths backed by the normal full/plugin and R2 ready-pair evidence; exclude partial,
+  diagnostic, verification-tail, archive-only, and currently growing files. Let `S` be the sum of
+  those lengths and `C` their count. The floor is `ceil(2 * S / C)` bytes. Recompute it before every
+  admission decision and whenever a 30-minute observation sees a newly completed sample. If `C` is
+  zero, retain the last sealed floor for that century and admit nothing from an invented estimate.
+  Record the exact epoch/length census, arithmetic, rounded byte floor, and evidence digests. When a
+  controller accepts only whole GiB, pass `ceil(floor_bytes / 2^30)`. Keep invocation-bound projected
+  remaining growth as a separate admission term; do not relabel the sum of those claims as the safety
+  floor. Admit a candidate only when current free bytes minus all evidence-backed active remaining
+  growth and the candidate's projected incremental peak still leaves this century floor intact.
+- Plan ordinary missing work as independently replayable and independently publishable singleton
+  epochs. Generate fresh manifests with `--target-cohort-epochs=1`, seal one epoch per replay claim,
+  and keep multiple disjoint singletons running concurrently up to fresh CPU, memory, VMA, I/O, and
+  century-floor admission. Backfill a freed lane promptly; otherwise parallel execution gains are
+  lost behind a shared completion gate. Do not make one epoch wait for an adjacent epoch before its
+  own verification, upload, readback, or `.sha256` sidecar. Preserve healthy legacy multi-epoch
+  replays already in flight instead of restarting them. Use a multi-epoch verification cohort only
+  when an exact compatibility/root requirement or the explicitly private epoch-301 verification
+  tail requires it, and keep its publication boundary sealed.
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Authenticated storage credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and
   `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The S3
@@ -105,7 +192,7 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   `--last-epoch` set to that verification endpoint and `--publish-through-epoch` set to the user's
   requested range end. Require the manifest's tail epochs to be marked
   `verification-tail-private`; never rely on an operator remembering an unrecorded boundary.
-- Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue in bounded cohorts as resources permit.
+- Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue with disjoint singleton epochs in parallel as fresh admission permits.
 - An R2 epoch is storage-complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and
   agree with verified local evidence. A checksum-only or archive-only epoch is incomplete. It is
   publication-complete only when that exact pair also passes the anonymous public-origin checks
@@ -147,7 +234,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 ## Produce and verify
 
 - Use the repository's sealed historical replay/controller path and automatic slot-range runtime selection. Do not invent a compatibility override.
-- Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Use `Restart=on-failure` with a bounded retry delay only when every invocation gets isolated diagnostic output and scratch, or a proven launcher preserves the failed invocation's artifacts before opening the next output. A replay normally creates or truncates its `.jet` at startup, so never let an automatic retry reuse the same diagnostic archive path. Use a fail-closed non-restarting unit and relaunch manually after evidence capture when attempt isolation is unavailable. Do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs and configured RAM/disk reserves.
+- Run generation and long-lived verification/upload watchers in persistent systemd units so loss of the interactive session cannot kill them. Use `Restart=on-failure` with a bounded retry delay only when every invocation gets isolated diagnostic output and scratch, or a proven launcher preserves the failed invocation's artifacts before opening the next output. A replay normally creates or truncates its `.jet` at startup, so never let an automatic retry reuse the same diagnostic archive path. Use a fail-closed non-restarting unit and relaunch manually after evidence capture when attempt isolation is unavailable. Do not use `Restart=always`, because successful completion must remain terminal. Respect unrelated jobs, configured RAM reserves, and the current century `.jet`-derived disk floor.
 - A controller with a long polling interval must wake that wait when SIGTERM/SIGINT requests
   shutdown; setting a flag while leaving a restartable sleep in place can consume the entire systemd
   stop timeout. Before sealing a new controller generation, verify a no-worker instance reaches
@@ -204,7 +291,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   SHA-256/inode binding. Never accept a missing MD5 field, fake a digest, or relax a legacy schema
   that requires MD5.
   Before transferring an absent snapshot, require actual free bytes to cover the complete expected
-  object size above the protected filesystem floor. Recheck the protected floor after hashing the
+  object size above the current century `.jet`-derived filesystem floor. Recheck that floor after hashing the
   temporary download and before no-clobber publication. If either gate fails, discard only the
   temporary download and leave the destination and receipt absent.
 - If live GCS inventory is temporarily unavailable, regroup only from a previously sealed v2, v3,
@@ -260,14 +347,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   independently qualified.
 - Do not raise replay concurrency from low CPU or RAM utilization alone. Snapshot extraction and
   historical account state can consume hundreds of GiB per worker; require the controller's
-  configured per-worker disk admission budget and measured filesystem growth to leave the reserve
-  intact before launching another cohort. If a manual canary set would violate that gate, stop the
+  configured per-worker disk admission budget and measured filesystem growth to leave the century
+  floor intact before launching another singleton. If a manual canary set would violate that gate, stop the
   newest units and preserve their private run directories for later resumption.
 - Keep scheduling estimates distinct from hard cgroup ceilings. A controller may cap fleet size
   through integer `logical_cpus / cpus_per_lane` or static-RAM arithmetic even when live CPU and
   reclaimable-memory headroom are ample. Before relaxing those estimates, bind exact producer
   invocations, compare multi-window effective CPU plus `MemoryCurrent`/`MemoryPeak`, and preserve
-  the established host memory reserve, disk reserve, VMA gate, `CPUQuota`, `MemoryHigh`, and
+  the established host memory reserve, century `.jet`-derived disk floor, VMA gate, `CPUQuota`, `MemoryHigh`, and
   `MemoryMax`. Change one sealed controller generation, prove that it admits only the intended new
   lane, and bind the resulting controller and producer invocation IDs into the reserve guard before
   leaving it unattended. Never weaken disk or VMA admission merely to work around a CPU/RAM
@@ -286,7 +373,7 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   external producer the same remaining-growth budget as a new local worker when stronger sealed
   evidence establishes heterogeneous claims. Use invocation-bound external growth claims derived
   from exact live trees and stable recent windows; keep the complete local worker budget for the
-  proposed launch and the global filesystem reserve. Bind those claims into the controller
+  proposed launch and the century `.jet`-derived filesystem floor. Bind those claims into the controller
   configuration and admission manifest. An absent unit, invocation mismatch, unbound producer, or
   sampling race must fall back to the conservative full per-worker budget. Re-run admission rather
   than editing claims underneath a live sealed controller.
@@ -296,22 +383,16 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   admission unit. Treat an identity rejection as a clean failed admission: confirm that its
   `OnSuccess` controller did not start, correct only the observed ownership or mode mismatch, reset
   the failed oneshot, and rerun the complete admission check rather than bypassing it.
-- Consecutive epochs using the same immutable runtime should normally be replayed as a bounded
-  contiguous cohort so later epochs carry the live runtime state and AccountsDb scratch instead of
-  restoring another bootstrap. A contiguous cohort is one ordered replay generation, not a set of independent
-  epoch jobs: select the complete range before launch, use one persistent producer/worker and one
-  scratch path, process every member in ascending order, emit a separate archive for each epoch,
-  and keep the same scratch/AccountsDb state live across member boundaries. Sharing a pathname is
-  not sufficient: do not stop and relaunch the worker, restore another snapshot, reopen the next
-  epoch as a fresh replay, or rebuild AccountsDb at a member boundary. Never clean, reinitialize,
-  or independently restore that scratch between cohort members. Budget bootstrap and scratch once
-  for the whole cohort, plus measured incremental growth, rather than charging every epoch as a
-  separate full restore. When several still-missing adjacent epochs share the same immutable
-  runtime and checkpoint chain, normally
-  target three to four epochs per continuous run before admitting more single-epoch workers, and
-  use a longer bounded run when measured scratch reuse and restart risk justify it. Shorten or split
-  the run whenever runtime, root, resource-admission, or live-claim boundaries require it. Prefer
-  this when duplicated bootstrap/scratch is the admission bottleneck.
+- Treat one ordinary epoch as one replay, verification, and publication unit even when adjacent
+  epochs share an immutable runtime. A singleton root-checkpoint cohort is valid and should reuse
+  the exact generation-pinned bootstrap through the reviewed cache input rather than sharing a
+  completion gate with neighboring epochs. Give every singleton its own claim, isolated output,
+  scratch, controller evidence, status object, verifiers, uploader eligibility, and terminal root.
+  Run many disjoint singleton units concurrently when fresh admission proves they fit. Measure and
+  report the restore cost, peak scratch, throughput, and time-to-sidecar so concurrency can be tuned
+  from evidence. Do not merge epochs merely to save a restore when doing so delays an otherwise
+  finished epoch's sidecar. Preserve any healthy multi-epoch generation that predates this policy;
+  its restart cost outweighs changing its shape mid-run.
   Never use a continuous root-cohort plan to cross or erase a focused-qualification-only
   compatibility gap. A diagnostic route that requires `--qualification-end-slot` remains
   independently checkpoint-gated and may explicitly forbid carried runtime state; qualify and
@@ -359,17 +440,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   outside its cohort, appears before a later cohort, or disagrees with the report-level publication
   boundary. This is mandatory for a private verification tail: for a 298-301 gate bounded at 300,
   epoch 301 must remain private even after all four archives verify successfully.
-  Keep independent root-verifiable cohorts parallel when disk admission is healthy and fleet wall
-  time is the priority: historical execution is often mostly serial within one worker, and an
-  unnecessarily long cohort increases the restart blast radius. Never merge across a runtime or
-  compatibility boundary, exceed the immutable worker's proven terminal bound, omit an
-  intermediate root check, overlap a live epoch claim, or publish any member before the complete
-  sealed cohort reaches its final root and passes the normal per-archive gates. Treat a requested
-  cohort length as a soft maximum: when its preferred endpoint lacks a root, finish at the latest
-  earlier root in that window; extend to the first later same-runtime root only when the whole
-  target window has no usable root. This bounds restart and publication blast radius without
-  inventing a checkpoint.
-- When a live replay's measured growth could cross the filesystem reserve before its next safe
+  Keep independently root-verifiable singleton epochs parallel whenever fresh admission is healthy:
+  historical execution is often mostly serial within one worker, so fleet concurrency is the main
+  wall-time lever. Never cross a runtime or compatibility boundary, exceed the immutable worker's
+  proven terminal bound, omit the epoch's terminal root, or overlap a live epoch claim. If an exact
+  root is unavailable and a bounded exceptional verification cohort is required, extend only to the
+  first compatible later root, seal the publication boundary, keep any verification tail private,
+  and do not generalize that exception into ordinary multi-epoch scheduling.
+- When a live replay's measured growth could cross the century `.jet`-derived filesystem floor before its next safe
   milestone, use an actual-free-space guard rather than relying only on projections. Bind the guard
   to the exact service invocation ID and zero-restart state, fsync a root-owned stop intent before
   stopping that one producer, and make an intent-only interruption resumable even if free space
@@ -395,10 +473,10 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   producer can remain active during terminal archive drainage; service identity, restart, and disk
   checks still apply. Prove the installed sandbox can read the exact worker's maps on its first fire.
   When admitting a new producer beside older live producers, set that producer's stop floor to the
-  global reserve plus the conservative remaining-growth budgets still owed to the older producers,
+  century `.jet`-derived floor plus the evidence-backed remaining-growth budgets still owed to the older producers,
   unless one proven aggregate guard serializes the complete fleet's response. Giving every lane an
-  independent guard at only the global reserve lets several lanes consume the same headroom and can
-  overshoot the reserve before their next samples. Record the exact budget formula and live claims
+  independent guard at only the century floor lets several lanes consume the same headroom and can
+  overshoot the floor before their next samples. Record the exact budget formula and live claims
   in the launch receipt; reduce the protected amount only from newer measured evidence, never from
   idle CPU or current scratch size alone.
   Do not leave an automatic admission trigger armed when the resulting controller can launch a
@@ -889,7 +967,9 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   different current-login socket is healthy. After any shell initialization, rediscover all
   candidate sockets and select only one whose `ssh-add -l` succeeds and lists an identity; never
   treat the socket exported by the startup file itself as proof that Git authentication is ready.
-- Never delete from R2, including during cleanup or retries.
+- Never delete from R2 during cleanup or retries. The only routine deletion authority is the exact
+  post-ready-pair removal of `epoch-N.epoch-status.json` described above; it never extends to an
+  archive, sidecar, receipt, or any other key.
 - Never use `--overwrite-existing` without both positive evidence that the existing remote `.jet` is erroneous and explicit user authorization for its replacement.
 - Upload the sidecar only after the complete `.jet` has passed remote readback and local source revalidation; the matching sidecar is the readiness marker.
 - Require an anonymous public-origin read of both the `.jet` and its sidecar after sidecar
@@ -898,11 +978,11 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
 - Refuse to begin upload without exact full and current-plugin receipts. Refuse local retirement without both adjacent-boundary receipts as well.
 - Do not treat a sidecar alone as proof that the archive was uploaded.
 - Resume idempotently from R2 inventory and private receipts after interruption.
-- Leave at least 30 minutes between routine status checks for each running job,
-  cohort, or durable watcher. After arming a persistent timer or watcher, do not poll
-  it in short empty loops or emit repeated no-change status turns; let it run
-  unattended and inspect it once the cadence interval has elapsed or its scheduled
-  event should have completed. This cadence conserves operator/model tokens as well
-  as host and API work. Diagnose an observed failure or answer an explicit operator
-  status request immediately, but do not use either as a reason to restart or
-  duplicate healthy work.
+- Leave exactly one normal 30-minute observation cadence for each running job, singleton, legacy
+  cohort, or durable watcher. Use that same identity-stable observation to refresh every claimed
+  epoch's `epoch-N.epoch-status.json`; do not poll separately for the table or for R2 metadata.
+  After arming a persistent timer or watcher, do not poll it in short empty loops or emit repeated
+  no-change status turns. Let it run unattended and inspect it once the cadence interval has elapsed
+  or its scheduled event should have completed. This cadence conserves operator/model tokens as well
+  as host and API work. Diagnose an observed failure or answer an explicit operator status request
+  immediately, but do not use either as a reason to restart or duplicate healthy work.

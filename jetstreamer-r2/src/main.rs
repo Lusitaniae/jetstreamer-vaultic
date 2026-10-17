@@ -25,6 +25,7 @@ use {
         redirect::Policy as RedirectPolicy,
     },
     serde::{Deserialize, Serialize},
+    serde_json::Value,
     sha2::{Digest as _, Sha256},
     std::{
         collections::BTreeSet,
@@ -41,6 +42,8 @@ use {
 const DEFAULT_PART_SIZE: u64 = 64 * 1024 * 1024;
 const DEFAULT_CONCURRENCY: usize = 8;
 const MAX_SIDECAR_BYTES: u64 = 512;
+const MAX_STATUS_BYTES: u64 = 16 * 1024;
+const MAX_OBSERVER_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PART_ATTEMPTS: usize = 8;
 const MAX_REMOTE_READ_ATTEMPTS: usize = 64;
 const MAX_REMOTE_READ_RANGE_SIZE: u64 = 64 * 1024 * 1024;
@@ -48,6 +51,8 @@ const MIN_REMOTE_READ_RANGE_SIZE: u64 = 8 * 1024 * 1024;
 const REMOTE_READ_BUFFER_BUDGET: u64 = 512 * 1024 * 1024;
 const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-receipt-v1";
 const PUBLIC_RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-public-read-receipt-v1";
+const STATUS_RECEIPT_SCHEMA: &str =
+    "jetstreamer-horizon-r2-status-authenticated-publication-receipt-v1";
 
 #[derive(Debug)]
 struct Config {
@@ -63,6 +68,13 @@ struct Config {
     legacy_etag_only: bool,
     overwrite_existing: bool,
     repair_orphaned_archive: bool,
+    observer_receipt: Option<PathBuf>,
+    observer_sha256: Option<String>,
+    expected_controller_invocation_id: Option<String>,
+    expected_producer_invocation_id: Option<String>,
+    elapsed_execution_millis: Option<u64>,
+    estimated_remaining_millis: Option<u64>,
+    phase: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +85,7 @@ enum Command {
     Sync,
     Verify,
     Restore,
+    StatusPublish,
 }
 
 #[derive(Clone, Debug)]
@@ -149,13 +162,43 @@ struct PublicReceipt {
     verified_unix_seconds: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct EpochStatus {
+    epoch: u64,
+    jet_size_bytes: u64,
+    elapsed_execution_millis: u64,
+    estimated_remaining_millis: u64,
+    sampled_at_utc: String,
+    phase: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StatusPublicationReceipt {
+    schema: String,
+    bucket: String,
+    epoch: u64,
+    key: String,
+    status: EpochStatus,
+    object_etag: String,
+    previous_object_etag: Option<String>,
+    observer_receipt: PathBuf,
+    observer_receipt_sha256: String,
+    controller_invocation_id: String,
+    producer_invocation_id: String,
+    authenticated_readback: bool,
+    verified_unix_seconds: u64,
+}
+
 fn usage() -> ! {
     eprintln!(concat!(
-        "usage: horizon-r2 <inventory|public-verify|retire-local|sync|verify|restore> DIRECTORY [--epochs START-END] ",
+        "usage: horizon-r2 <inventory|public-verify|retire-local|sync|verify|restore|status-publish> DIRECTORY [--epochs START-END] ",
         "[--receipt-directory DIRECTORY] [--public-receipt-directory DIRECTORY] [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
         "[--repair-orphaned-archive] ",
-        "[--concurrency N]"
+        "[--concurrency N] [--observer-receipt FILE] [--observer-sha256 HEX] ",
+        "[--expected-controller-invocation-id ID] [--expected-producer-invocation-id ID] ",
+        "[--elapsed-execution-millis N] [--estimated-remaining-millis N] [--phase PHASE]"
     ));
     std::process::exit(2);
 }
@@ -173,6 +216,7 @@ fn parse_args() -> Result<Config> {
         Some("sync") => Command::Sync,
         Some("verify") => Command::Verify,
         Some("restore") => Command::Restore,
+        Some("status-publish") => Command::StatusPublish,
         _ => usage(),
     };
     let directory = args.next().map(PathBuf::from).unwrap_or_else(|| usage());
@@ -186,6 +230,13 @@ fn parse_args() -> Result<Config> {
     let mut legacy_etag_only = false;
     let mut overwrite_existing = false;
     let mut repair_orphaned_archive = false;
+    let mut observer_receipt = None;
+    let mut observer_sha256 = None;
+    let mut expected_controller_invocation_id = None;
+    let mut expected_producer_invocation_id = None;
+    let mut elapsed_execution_millis = None;
+    let mut estimated_remaining_millis = None;
+    let mut phase = None;
     while let Some(argument) = args.next() {
         let argument = argument
             .into_string()
@@ -208,6 +259,27 @@ fn parse_args() -> Result<Config> {
             "--legacy-etag-only" => legacy_etag_only = true,
             "--overwrite-existing" => overwrite_existing = true,
             "--repair-orphaned-archive" => repair_orphaned_archive = true,
+            "--observer-receipt" => observer_receipt = Some(PathBuf::from(value()?)),
+            "--observer-sha256" => observer_sha256 = Some(value()?),
+            "--expected-controller-invocation-id" => {
+                expected_controller_invocation_id = Some(value()?)
+            }
+            "--expected-producer-invocation-id" => expected_producer_invocation_id = Some(value()?),
+            "--elapsed-execution-millis" => {
+                elapsed_execution_millis = Some(
+                    value()?
+                        .parse()
+                        .context("invalid --elapsed-execution-millis")?,
+                )
+            }
+            "--estimated-remaining-millis" => {
+                estimated_remaining_millis = Some(
+                    value()?
+                        .parse()
+                        .context("invalid --estimated-remaining-millis")?,
+                )
+            }
+            "--phase" => phase = Some(value()?),
             "--concurrency" => {
                 concurrency = value()?.parse().context("invalid --concurrency")?;
                 ensure!(
@@ -246,6 +318,12 @@ fn parse_args() -> Result<Config> {
             "public receipt directory must be absolute"
         );
     }
+    if let Some(observer_receipt) = &observer_receipt {
+        ensure!(
+            observer_receipt.is_absolute(),
+            "observer receipt path must be absolute"
+        );
+    }
     ensure!(
         public_receipt_directory.is_none() || command == Command::PublicVerify,
         "--public-receipt-directory is valid only with public-verify"
@@ -270,15 +348,85 @@ fn parse_args() -> Result<Config> {
         !legacy_etag_only || matches!(command, Command::Sync | Command::Verify),
         "--legacy-etag-only is valid only with sync or verify"
     );
+    let status_options_present = observer_receipt.is_some()
+        || observer_sha256.is_some()
+        || expected_controller_invocation_id.is_some()
+        || expected_producer_invocation_id.is_some()
+        || elapsed_execution_millis.is_some()
+        || estimated_remaining_millis.is_some()
+        || phase.is_some();
+    ensure!(
+        command == Command::StatusPublish || !status_options_present,
+        "status publication options are valid only with status-publish"
+    );
+    if command == Command::StatusPublish {
+        ensure!(observer_receipt.is_some(), "--observer-receipt is required");
+        ensure!(observer_sha256.is_some(), "--observer-sha256 is required");
+        ensure!(
+            expected_controller_invocation_id.is_some(),
+            "--expected-controller-invocation-id is required"
+        );
+        ensure!(
+            expected_producer_invocation_id.is_some(),
+            "--expected-producer-invocation-id is required"
+        );
+        ensure!(
+            elapsed_execution_millis.is_some(),
+            "--elapsed-execution-millis is required"
+        );
+        ensure!(
+            estimated_remaining_millis.is_some(),
+            "--estimated-remaining-millis is required"
+        );
+        ensure!(phase.is_some(), "--phase is required");
+        ensure!(
+            !delete_local && !overwrite_existing && !repair_orphaned_archive && !legacy_etag_only,
+            "archive mutation/legacy options are invalid with status-publish"
+        );
+        let observer_sha256 = observer_sha256.as_deref().expect("checked");
+        ensure!(
+            is_lower_hex(observer_sha256, 64),
+            "--observer-sha256 must be 64 lowercase hexadecimal characters"
+        );
+        for (label, invocation_id) in [
+            (
+                "--expected-controller-invocation-id",
+                expected_controller_invocation_id
+                    .as_deref()
+                    .expect("checked"),
+            ),
+            (
+                "--expected-producer-invocation-id",
+                expected_producer_invocation_id.as_deref().expect("checked"),
+            ),
+        ] {
+            ensure!(
+                is_lower_hex(invocation_id, 32),
+                "{label} must be 32 lowercase hexadecimal characters"
+            );
+        }
+        ensure!(
+            matches!(
+                phase.as_deref().expect("checked"),
+                "replay" | "verification" | "upload" | "readback"
+            ),
+            "--phase must be replay, verification, upload, or readback"
+        );
+    }
     let epochs = match (command, epochs) {
         (Command::Inventory, None) => bail!("inventory requires --epochs START-END"),
         (Command::PublicVerify, None) => bail!("public-verify requires --epochs START-END"),
         (Command::RetireLocal, None) => bail!("retire-local requires --epochs START-END"),
         (Command::Restore, None) => bail!("restore requires --epochs START-END"),
+        (Command::StatusPublish, None) => bail!("status-publish requires --epochs N-N"),
         (_, Some(epochs)) => epochs,
         (_, None) => discover_local_epochs(&directory)?,
     };
     ensure!(!epochs.is_empty(), "no Horizon epochs selected");
+    ensure!(
+        command != Command::StatusPublish || epochs.len() == 1,
+        "status-publish requires exactly one epoch"
+    );
     Ok(Config {
         command,
         directory,
@@ -292,6 +440,13 @@ fn parse_args() -> Result<Config> {
         legacy_etag_only,
         overwrite_existing,
         repair_orphaned_archive,
+        observer_receipt,
+        observer_sha256,
+        expected_controller_invocation_id,
+        expected_producer_invocation_id,
+        elapsed_execution_millis,
+        estimated_remaining_millis,
+        phase,
     })
 }
 
@@ -582,6 +737,51 @@ fn hex_lower(bytes: &[u8]) -> String {
     output
 }
 
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+}
+
+fn is_canonical_utc(value: &str) -> bool {
+    value.len() == 20
+        && value.as_bytes()[4] == b'-'
+        && value.as_bytes()[7] == b'-'
+        && value.as_bytes()[10] == b'T'
+        && value.as_bytes()[13] == b':'
+        && value.as_bytes()[16] == b':'
+        && value.as_bytes()[19] == b'Z'
+        && value.bytes().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+}
+
+fn read_stable_bounded(path: &Path, maximum: u64, label: &str) -> Result<Vec<u8>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open {label} {}", path.display()))?;
+    let before = file.metadata()?;
+    ensure!(before.is_file(), "{label} is not a regular file");
+    ensure!(before.nlink() == 1, "{label} has multiple hard links");
+    ensure!(before.len() <= maximum, "{label} exceeds size bound");
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len())?);
+    (&mut file).take(maximum + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= maximum, "{label} exceeds size bound");
+    let after = file.metadata()?;
+    ensure!(
+        identity(&before) == identity(&after),
+        "{label} changed while read"
+    );
+    ensure!(
+        regular_identity(path)? == identity(&after),
+        "{label} namespace changed while read"
+    );
+    Ok(bytes)
+}
+
 async fn remote_sidecar(client: &Client, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
     match client.get_object().bucket(bucket).key(key).send().await {
         Ok(response) => {
@@ -870,6 +1070,359 @@ async fn public_verify_epoch(
         .ok_or_else(|| anyhow!("authenticated R2 sidecar is missing"))?;
     let receipt = verify_public_pair(http, public, &r2.bucket, epoch, &archive, &sidecar).await?;
     write_public_receipt(receipt_directory, &receipt)
+}
+
+#[derive(Debug)]
+struct MutableRemoteObject {
+    bytes: Vec<u8>,
+    etag: String,
+}
+
+async fn get_mutable_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<MutableRemoteObject>> {
+    match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(response) => {
+            let length = u64::try_from(response.content_length().unwrap_or(-1))
+                .context("mutable R2 object has invalid length")?;
+            ensure!(length <= MAX_STATUS_BYTES, "mutable R2 object is oversized");
+            let etag = response
+                .e_tag()
+                .ok_or_else(|| anyhow!("mutable R2 object has no ETag"))?;
+            let etag = normalize_etag(etag).to_owned();
+            ensure!(!etag.is_empty(), "mutable R2 object has an empty ETag");
+            let bytes = response.body.collect().await?.into_bytes().to_vec();
+            ensure!(
+                u64::try_from(bytes.len())? == length,
+                "mutable R2 object length changed during readback"
+            );
+            Ok(Some(MutableRemoteObject { bytes, etag }))
+        }
+        Err(error) if error.as_service_error().is_some_and(|e| e.is_no_such_key()) => Ok(None),
+        Err(error) => Err(error).context("failed to fetch mutable R2 object"),
+    }
+}
+
+fn observer_string<'a>(value: &'a Value, path: &[&str]) -> Result<&'a str> {
+    let mut current = value;
+    for name in path {
+        current = current
+            .get(*name)
+            .ok_or_else(|| anyhow!("observer receipt omits {}", path.join(".")))?;
+    }
+    current
+        .as_str()
+        .ok_or_else(|| anyhow!("observer receipt {} is not a string", path.join(".")))
+}
+
+fn observer_u64(value: &Value, path: &[&str]) -> Result<u64> {
+    let mut current = value;
+    for name in path {
+        current = current
+            .get(*name)
+            .ok_or_else(|| anyhow!("observer receipt omits {}", path.join(".")))?;
+    }
+    current
+        .as_u64()
+        .ok_or_else(|| anyhow!("observer receipt {} is not a u64", path.join(".")))
+}
+
+fn validate_observer_binding(
+    bytes: &[u8],
+    expected_sha256: &str,
+    epoch: u64,
+    expected_controller_invocation_id: &str,
+    expected_producer_invocation_id: &str,
+) -> Result<String> {
+    ensure!(
+        hex_lower(&Sha256::digest(bytes)) == expected_sha256,
+        "observer receipt SHA-256 mismatch"
+    );
+    let value: Value = serde_json::from_slice(bytes).context("invalid observer receipt JSON")?;
+    ensure!(
+        observer_string(&value, &["schema"])? == "jetstreamer-horizon-live-resource-sample-v2",
+        "unsupported observer receipt schema"
+    );
+    let sampled_at_utc = observer_string(&value, &["recorded_at_utc"])?;
+    ensure!(
+        is_canonical_utc(sampled_at_utc),
+        "observer receipt recorded_at_utc is not canonical UTC"
+    );
+    for name in [
+        "producer_or_controller_signals_sent",
+        "service_state_changed",
+        "remote_mutations",
+        "r2_mutations",
+    ] {
+        ensure!(
+            value
+                .get("mutation")
+                .and_then(|mutation| mutation.get(name))
+                .and_then(Value::as_bool)
+                == Some(false),
+            "observer receipt reports mutation or omits mutation.{name}"
+        );
+    }
+    let replays = value
+        .get("replays")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("observer receipt replays is not an array"))?;
+    let mut matches = replays.iter().filter(|replay| {
+        replay
+            .get("range")
+            .and_then(Value::as_str)
+            .and_then(|range| parse_epoch_range(range).ok())
+            .is_some_and(|epochs| epochs.contains(&epoch))
+    });
+    let replay = matches
+        .next()
+        .ok_or_else(|| anyhow!("observer receipt has no replay claim for epoch {epoch}"))?;
+    ensure!(
+        matches.next().is_none(),
+        "observer receipt has overlapping replay claims for epoch {epoch}"
+    );
+    ensure!(
+        replay
+            .get("invocation_binding_stable")
+            .and_then(Value::as_bool)
+            == Some(true),
+        "observer invocation binding is not stable"
+    );
+    for point in ["controller_before", "controller_after"] {
+        ensure!(
+            observer_string(replay, &[point, "invocation_id"])?
+                == expected_controller_invocation_id,
+            "observer controller invocation ID mismatch"
+        );
+        ensure!(
+            observer_u64(replay, &[point, "restarts"])? == 0,
+            "observer controller has restarted"
+        );
+    }
+    for point in ["producer_before", "producer_after"] {
+        ensure!(
+            observer_string(replay, &[point, "invocation_id"])? == expected_producer_invocation_id,
+            "observer producer invocation ID mismatch"
+        );
+        ensure!(
+            observer_u64(replay, &[point, "restarts"])? == 0,
+            "observer producer has restarted"
+        );
+    }
+    ensure!(
+        observer_string(replay, &["useful_work", "journal_invocation_id"])?
+            == expected_producer_invocation_id,
+        "observer progress is bound to a different producer invocation"
+    );
+    Ok(sampled_at_utc.to_owned())
+}
+
+fn current_jet_size(directory: &Path, epoch: u64) -> Result<u64> {
+    let path = directory.join(format!("epoch-{epoch}.jet"));
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "current .jet is not a regular file"
+            );
+            ensure!(
+                metadata.nlink() == 1,
+                "current .jet has multiple hard links"
+            );
+            Ok(metadata.len())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+fn status_receipt_path(directory: &Path, status: &EpochStatus) -> PathBuf {
+    let timestamp = status
+        .sampled_at_utc
+        .bytes()
+        .filter(|byte| byte.is_ascii_digit())
+        .map(char::from)
+        .collect::<String>();
+    directory.join(format!("epoch-{}.status-{timestamp}.json", status.epoch))
+}
+
+fn validate_status_replacement(previous: &EpochStatus, proposed: &EpochStatus) -> Result<()> {
+    validate_epoch_status(previous, proposed.epoch)?;
+    validate_epoch_status(proposed, proposed.epoch)?;
+    ensure!(
+        previous.epoch == proposed.epoch,
+        "existing status object names a different epoch"
+    );
+    ensure!(
+        previous.sampled_at_utc < proposed.sampled_at_utc,
+        "existing status sample is not older than the proposed sample"
+    );
+    Ok(())
+}
+
+fn validate_epoch_status(status: &EpochStatus, expected_epoch: u64) -> Result<()> {
+    ensure!(
+        status.epoch == expected_epoch,
+        "status object names a different epoch"
+    );
+    ensure!(
+        is_canonical_utc(&status.sampled_at_utc),
+        "status object sampled_at_utc is not canonical UTC"
+    );
+    ensure!(
+        matches!(
+            status.phase.as_str(),
+            "replay" | "verification" | "upload" | "readback"
+        ),
+        "status object phase is invalid"
+    );
+    Ok(())
+}
+
+fn write_status_receipt(directory: &Path, receipt: &StatusPublicationReceipt) -> Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    fs::set_permissions(
+        directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    let final_path = status_receipt_path(directory, &receipt.status);
+    if final_path.exists() {
+        let before = regular_identity(&final_path)?;
+        ensure!(
+            before.length <= MAX_STATUS_BYTES,
+            "status receipt is oversized"
+        );
+        let existing: StatusPublicationReceipt = serde_json::from_slice(&fs::read(&final_path)?)?;
+        ensure!(
+            regular_identity(&final_path)? == before,
+            "status receipt changed while read"
+        );
+        ensure!(existing == *receipt, "existing status receipt differs");
+        return Ok(final_path);
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".epoch-{}.status.", receipt.epoch))
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    temporary
+        .as_file_mut()
+        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), receipt)?;
+    temporary.as_file_mut().write_all(b"\n")?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist_noclobber(&final_path).map_err(|error| {
+        anyhow!(
+            "failed to publish {}: {}",
+            final_path.display(),
+            error.error
+        )
+    })?;
+    File::open(directory)?.sync_all()?;
+    Ok(final_path)
+}
+
+async fn status_publish(
+    s3: &Client,
+    r2: &R2Config,
+    config: &Config,
+    epoch: u64,
+) -> Result<PathBuf> {
+    let observer_receipt = config.observer_receipt.as_deref().expect("validated");
+    let observer_bytes = read_stable_bounded(
+        observer_receipt,
+        MAX_OBSERVER_RECEIPT_BYTES,
+        "observer receipt",
+    )?;
+    let sampled_at_utc = validate_observer_binding(
+        &observer_bytes,
+        config.observer_sha256.as_deref().expect("validated"),
+        epoch,
+        config
+            .expected_controller_invocation_id
+            .as_deref()
+            .expect("validated"),
+        config
+            .expected_producer_invocation_id
+            .as_deref()
+            .expect("validated"),
+    )?;
+    let status = EpochStatus {
+        epoch,
+        jet_size_bytes: current_jet_size(&config.directory, epoch)?,
+        elapsed_execution_millis: config.elapsed_execution_millis.expect("validated"),
+        estimated_remaining_millis: config.estimated_remaining_millis.expect("validated"),
+        sampled_at_utc,
+        phase: config.phase.clone().expect("validated"),
+    };
+    validate_epoch_status(&status, epoch)?;
+    let mut status_bytes = serde_json::to_vec_pretty(&status)?;
+    status_bytes.push(b'\n');
+    ensure!(
+        status_bytes.len() <= MAX_STATUS_BYTES as usize,
+        "status payload is oversized"
+    );
+    let key = format!("epoch-{epoch}.epoch-status.json");
+    let previous = get_mutable_object(s3, &r2.bucket, &key).await?;
+    if let Some(previous) = &previous {
+        let previous_status: EpochStatus =
+            serde_json::from_slice(&previous.bytes).context("existing status JSON is invalid")?;
+        validate_status_replacement(&previous_status, &status)?;
+    }
+    let content_md5 = BASE64_STANDARD.encode(Md5::digest(&status_bytes));
+    let request = s3
+        .put_object()
+        .bucket(&r2.bucket)
+        .key(&key)
+        .content_type("application/json; charset=utf-8")
+        .cache_control("no-store")
+        .content_md5(content_md5)
+        .body(ByteStream::from(status_bytes.clone()));
+    let request = if let Some(previous) = &previous {
+        request.if_match(format!("\"{}\"", previous.etag))
+    } else {
+        request.if_none_match("*")
+    };
+    request
+        .send()
+        .await
+        .map_err(|error| anyhow!("conditional status publication failed: {error:?}"))?;
+    let authenticated = get_mutable_object(s3, &r2.bucket, &key)
+        .await?
+        .ok_or_else(|| anyhow!("status object disappeared after publication"))?;
+    ensure!(
+        authenticated.bytes == status_bytes,
+        "authenticated status readback differs from uploaded bytes"
+    );
+    let receipt = StatusPublicationReceipt {
+        schema: STATUS_RECEIPT_SCHEMA.to_owned(),
+        bucket: r2.bucket.clone(),
+        epoch,
+        key,
+        status,
+        object_etag: authenticated.etag,
+        previous_object_etag: previous.map(|value| value.etag),
+        observer_receipt: observer_receipt.to_path_buf(),
+        observer_receipt_sha256: config.observer_sha256.clone().expect("validated"),
+        controller_invocation_id: config
+            .expected_controller_invocation_id
+            .clone()
+            .expect("validated"),
+        producer_invocation_id: config
+            .expected_producer_invocation_id
+            .clone()
+            .expect("validated"),
+        authenticated_readback: true,
+        verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    };
+    write_status_receipt(
+        config
+            .receipt_directory
+            .as_deref()
+            .expect("status-publish requires receipt directory"),
+        &receipt,
+    )
 }
 
 async fn head_archive(client: &Client, bucket: &str, key: &str) -> Result<Option<RemoteArchive>> {
@@ -2042,6 +2595,17 @@ async fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if config.command == Command::StatusPublish {
+        let epoch = *config.epochs.first().expect("one status epoch validated");
+        let receipt_path = status_publish(&client, &r2, &config, epoch)
+            .await
+            .with_context(|| format!("epoch {epoch} status publication failed"))?;
+        eprintln!(
+            "epoch {epoch}: status conditionally published and authenticated-readback verified, receipt {}",
+            receipt_path.display()
+        );
+        return Ok(());
+    }
     for &epoch in &config.epochs {
         match config.command {
             Command::RetireLocal => retire_verified_local_epoch(&client, &r2, &config, epoch)
@@ -2053,7 +2617,7 @@ async fn main() -> Result<()> {
             Command::Sync | Command::Verify => sync_epoch(&client, &r2, &config, epoch)
                 .await
                 .with_context(|| format!("epoch {epoch} R2 delivery failed"))?,
-            Command::Inventory | Command::PublicVerify => {
+            Command::Inventory | Command::PublicVerify | Command::StatusPublish => {
                 unreachable!("read-only command handled above")
             }
         }
@@ -2110,6 +2674,91 @@ mod tests {
                 "accepted {invalid}"
             );
         }
+    }
+
+    #[test]
+    fn status_schema_is_exact_and_observer_binding_is_stable() {
+        let controller = "ab".repeat(16);
+        let producer = "cd".repeat(16);
+        let observer = serde_json::json!({
+            "schema": "jetstreamer-horizon-live-resource-sample-v2",
+            "recorded_at_utc": "2026-10-17T01:10:00Z",
+            "mutation": {
+                "producer_or_controller_signals_sent": false,
+                "service_state_changed": false,
+                "remote_mutations": false,
+                "r2_mutations": false
+            },
+            "replays": [{
+                "range": "216-219",
+                "invocation_binding_stable": true,
+                "controller_before": {"invocation_id": controller, "restarts": 0},
+                "controller_after": {"invocation_id": controller, "restarts": 0},
+                "producer_before": {"invocation_id": producer, "restarts": 0},
+                "producer_after": {"invocation_id": producer, "restarts": 0},
+                "useful_work": {"journal_invocation_id": producer}
+            }]
+        });
+        let bytes = serde_json::to_vec(&observer).unwrap();
+        let digest = hex_lower(&Sha256::digest(&bytes));
+        assert_eq!(
+            validate_observer_binding(&bytes, &digest, 218, &controller, &producer).unwrap(),
+            "2026-10-17T01:10:00Z"
+        );
+        assert!(validate_observer_binding(&bytes, &digest, 220, &controller, &producer).is_err());
+
+        let exact = br#"{
+            "epoch": 218,
+            "jet_size_bytes": 0,
+            "elapsed_execution_millis": 123,
+            "estimated_remaining_millis": 456,
+            "sampled_at_utc": "2026-10-17T01:10:00Z",
+            "phase": "replay"
+        }"#;
+        let status: EpochStatus = serde_json::from_slice(exact).unwrap();
+        assert_eq!(status.epoch, 218);
+        validate_epoch_status(&status, 218).unwrap();
+        assert!(validate_epoch_status(&status, 219).is_err());
+        let mut invalid_status = status.clone();
+        invalid_status.phase = "unknown".to_owned();
+        assert!(validate_epoch_status(&invalid_status, 218).is_err());
+        invalid_status = status.clone();
+        invalid_status.sampled_at_utc = "2026-10-17 01:10:00Z".to_owned();
+        assert!(validate_epoch_status(&invalid_status, 218).is_err());
+        let mut with_extra: Value = serde_json::from_slice(exact).unwrap();
+        with_extra["extra"] = Value::from(true);
+        assert!(serde_json::from_value::<EpochStatus>(with_extra).is_err());
+    }
+
+    #[test]
+    fn status_timestamp_and_receipt_name_are_canonical() {
+        assert!(is_canonical_utc("2026-10-17T01:10:00Z"));
+        for invalid in [
+            "2026-10-17 01:10:00Z",
+            "2026-10-17T01:10:00+00:00",
+            "2026-10-17T01:10:00z",
+        ] {
+            assert!(!is_canonical_utc(invalid));
+        }
+        let status = EpochStatus {
+            epoch: 218,
+            jet_size_bytes: 0,
+            elapsed_execution_millis: 1,
+            estimated_remaining_millis: 2,
+            sampled_at_utc: "2026-10-17T01:10:00Z".to_owned(),
+            phase: "replay".to_owned(),
+        };
+        assert_eq!(
+            status_receipt_path(Path::new("/private"), &status),
+            Path::new("/private/epoch-218.status-20261017011000.json")
+        );
+        let mut older = status.clone();
+        older.sampled_at_utc = "2026-10-17T00:40:00Z".to_owned();
+        validate_status_replacement(&older, &status).unwrap();
+        assert!(validate_status_replacement(&status, &older).is_err());
+        assert!(validate_status_replacement(&status, &status).is_err());
+        older.epoch = 219;
+        assert!(validate_status_replacement(&older, &status).is_err());
     }
 
     fn public_receipt(epoch: u64) -> PublicReceipt {

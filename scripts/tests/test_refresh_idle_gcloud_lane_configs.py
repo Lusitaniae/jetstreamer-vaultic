@@ -97,6 +97,75 @@ class IdleGCloudRefreshTests(unittest.TestCase):
                 refresh.tree_summary(root)
 
     @patch("scripts.refresh_idle_gcloud_lane_configs.os.path.ismount", return_value=False)
+    def test_tree_summary_allows_only_explicitly_bound_empty_lane(self, _ismount) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "config"
+            root.mkdir(mode=0o700)
+            with self.assertRaisesRegex(refresh.RefreshError, "contains no files"):
+                refresh.tree_summary(root)
+            summary = refresh.tree_summary(root, allow_empty=True)
+            self.assertEqual(summary["file_count"], 0)
+            self.assertEqual(summary["file_bytes"], 0)
+
+    @patch("scripts.refresh_idle_gcloud_lane_configs.os.path.ismount", return_value=False)
+    def test_install_accepts_empty_initial_lane_and_retains_empty_backup(self, _ismount) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            effective = root / "gcloud"
+            staged = root / "gcloud.staged"
+            backup = root / "gcloud.backup"
+            receipt = root / "lane.json"
+            effective.mkdir(mode=0o700)
+            staged.mkdir(mode=0o700)
+            (staged / "credentials.db").write_bytes(b"new")
+            refresh.normalize_config_tree(staged, os.getuid(), os.getgid())
+            old_summary = refresh.tree_summary(effective, allow_empty=True)
+            staged_summary = refresh.tree_summary(staged)
+            staged_probe = {"generation": 123, "identity_field": "storage_url"}
+            lane = {
+                "label": "lane-a",
+                "uid": os.getuid(),
+                "gid": os.getgid(),
+                "controller": "controller.service",
+                "effective_config": str(effective),
+                "staged_config": str(staged),
+                "backup_config": str(backup),
+                "receipt": str(receipt),
+            }
+            bound = {
+                "old_summary": old_summary,
+                "staged_summary": staged_summary,
+                "staged_probe": staged_probe,
+            }
+            plan = {
+                "units": [],
+                "boot_id": "a" * 32,
+                "workspace": {"path": str(root)},
+            }
+
+            def read_test_receipt(path: Path, _label: str) -> tuple[dict, str]:
+                return json.loads(path.read_text()), "unused"
+
+            with (
+                patch.object(refresh, "receipt_path", return_value=receipt),
+                patch.object(refresh, "require_workspace"),
+                patch.object(refresh, "require_idle", return_value=[]),
+                patch.object(refresh, "process_references", return_value=[]),
+                patch.object(refresh, "probe_config", return_value=staged_probe),
+                patch.object(
+                    refresh.base,
+                    "require_root_private_json",
+                    side_effect=read_test_receipt,
+                ),
+            ):
+                refresh.install_lane(plan, "d" * 64, lane, bound)
+            self.assertEqual((effective / "credentials.db").read_bytes(), b"new")
+            self.assertTrue(backup.is_dir())
+            self.assertEqual(
+                refresh.tree_summary(backup, allow_empty=True)["file_count"], 0
+            )
+
+    @patch("scripts.refresh_idle_gcloud_lane_configs.os.path.ismount", return_value=False)
     def test_atomic_directory_exchange(self, _ismount) -> None:
         with TemporaryDirectory() as temporary:
             root = Path(temporary)

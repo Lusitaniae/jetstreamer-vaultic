@@ -13,8 +13,8 @@ another lane:
 
 - controller CPU arithmetic and per-lane quota;
 - protected memory, memory reserve, scheduling admission, `MemoryHigh`, and `MemoryMax`;
-- physical scratch use, conservative remaining-growth claims, candidate budget, and filesystem
-  reserve;
+- physical scratch use, evidence-backed remaining-growth claims, candidate incremental peak, and
+  the current century floor computed as twice the mean canonical `.jet` size;
 - live worker VMA counts, `vm.max_map_count`, the configured VMA stop, and credible VMA growth;
 - I/O pressure, major faults, memory pressure, and any current verifier, uploader, or snapshot
   activity that materially contends with replay.
@@ -28,8 +28,8 @@ generation under unchanged hard ceilings and reserves.
 Call the highest concurrency demonstrated by a clean coordinated observation under equivalent
 runtime, lane shape, reserve policy, and guard settings the **proven operating point**. A valid
 sample binds every live invocation and scratch tree before and after measurement, reports zero
-restarts, preserves the filesystem reserve, and remains below the VMA stops. Do not transfer a
-proven count between materially different machines or lane shapes without new evidence.
+restarts, preserves the century `.jet`-derived filesystem floor, and remains below the VMA stops.
+Do not transfer a proven count between materially different machines or lane shapes without new evidence.
 
 ## Keep the host work-conserving
 
@@ -50,21 +50,24 @@ proven count between materially different machines or lane shapes without new ev
 - Overlap independent full verification, plugin verification, authenticated R2 upload, and remote
   readback with replay. Keep their receipt gates independent, and account for their measured I/O,
   CPU, and memory pressure when admitting another replay lane.
-- Prefer continuous three-to-four-epoch same-runtime cohorts when they avoid repeated snapshot and
-  AccountsDb setup. Keep independent root-verifiable cohorts parallel when the admission envelope
-  allows it. Never extend a cohort across a runtime, checkpoint, or qualification boundary merely
-  to keep a worker busy.
+- Prefer independently replayable and publishable singleton epochs. Keep as many disjoint,
+  root-verifiable singletons parallel as fresh admission and the proven operating point allow, and
+  promptly fill every safe lane. Reuse sealed snapshot inputs where possible, but do not trade away
+  per-epoch completion, verification, upload, and sidecar latency merely to avoid setup work.
+  Preserve already-healthy legacy multi-epoch replays rather than restarting them.
 
 Use event-driven systemd dependencies or timers for completion, guard, verifier, and uploader work
 instead of frequent polling. Routine coordinated observations remain at least 1,800 seconds apart.
 
 ## Scale beyond the proven point
 
-Increase by exactly one replay lane at a time. Before the increase, require a fresh clean
+Increase beyond the proven operating point by exactly one replay lane at a time; capacity at or
+below the proven point should be filled concurrently as soon as each singleton passes admission.
+Before an experimental increase, require a fresh clean
 coordinated sample of the current fleet taken at least 1,800 seconds after the preceding routine
 sample, current no-trip guard receipts, complete admission arithmetic, and a dormant candidate with
-disjoint work. Keep hard cgroup ceilings, the global filesystem reserve, per-lane or aggregate
-remaining-growth protection, and VMA stops unchanged.
+disjoint work. Keep hard cgroup ceilings, the century `.jet`-derived filesystem floor,
+evidence-backed remaining-growth protection, and VMA stops unchanged.
 
 After launch, capture exact controller and producer invocation IDs, install and manually prove the
 invocation-bound guard immediately, and require its first real sandboxed timer fire to succeed.
