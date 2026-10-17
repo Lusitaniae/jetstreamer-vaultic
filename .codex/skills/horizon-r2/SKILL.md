@@ -156,6 +156,13 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
     --status-publication-sha256 STATUS_RECEIPT_SHA256
   ```
 
+  For an event-driven cleanup triggered by the durable archive receipt, replace the two explicit
+  publication-receipt options with `--latest-status-publication-receipt`. The Rust command must
+  scan only the configured private status-receipt directory, validate every matching canonical
+  publication receipt, select the greatest canonical sample timestamp, compute its SHA-256 itself,
+  and bind the resulting exact path and digest into the deletion receipt. Do not discover the
+  latest receipt with a shell glob or mtime.
+
   The command must revalidate the durable whole-object archive receipt and authenticated archive/
   sidecar pair before and after deletion, require the current status bytes and ETag to match the
   bound publication receipt, issue one conditional delete for only the canonical status key,

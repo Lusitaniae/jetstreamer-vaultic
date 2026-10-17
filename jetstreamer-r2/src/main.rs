@@ -82,6 +82,7 @@ struct Config {
     archive_receipt_directory: Option<PathBuf>,
     status_publication_receipt: Option<PathBuf>,
     status_publication_sha256: Option<String>,
+    latest_status_publication_receipt: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,7 +230,7 @@ fn usage() -> ! {
         "[--expected-controller-invocation-id ID] [--expected-producer-invocation-id ID] ",
         "[--elapsed-execution-millis N] [--estimated-remaining-millis N] [--phase PHASE] ",
         "[--archive-receipt-directory DIRECTORY] [--status-publication-receipt FILE] ",
-        "[--status-publication-sha256 HEX]"
+        "[--status-publication-sha256 HEX] [--latest-status-publication-receipt]"
     ));
     std::process::exit(2);
 }
@@ -272,6 +273,7 @@ fn parse_args() -> Result<Config> {
     let mut archive_receipt_directory = None;
     let mut status_publication_receipt = None;
     let mut status_publication_sha256 = None;
+    let mut latest_status_publication_receipt = false;
     while let Some(argument) = args.next() {
         let argument = argument
             .into_string()
@@ -322,6 +324,7 @@ fn parse_args() -> Result<Config> {
                 status_publication_receipt = Some(PathBuf::from(value()?))
             }
             "--status-publication-sha256" => status_publication_sha256 = Some(value()?),
+            "--latest-status-publication-receipt" => latest_status_publication_receipt = true,
             "--concurrency" => {
                 concurrency = value()?.parse().context("invalid --concurrency")?;
                 ensure!(
@@ -415,7 +418,8 @@ fn parse_args() -> Result<Config> {
     );
     let status_delete_options_present = archive_receipt_directory.is_some()
         || status_publication_receipt.is_some()
-        || status_publication_sha256.is_some();
+        || status_publication_sha256.is_some()
+        || latest_status_publication_receipt;
     ensure!(
         command == Command::StatusDelete || !status_delete_options_present,
         "status deletion options are valid only with status-delete"
@@ -480,21 +484,26 @@ fn parse_args() -> Result<Config> {
             "--archive-receipt-directory is required"
         );
         ensure!(
-            status_publication_receipt.is_some(),
-            "--status-publication-receipt is required"
-        );
-        ensure!(
-            status_publication_sha256.is_some(),
-            "--status-publication-sha256 is required"
+            matches!(
+                (
+                    status_publication_receipt.is_some(),
+                    status_publication_sha256.is_some(),
+                    latest_status_publication_receipt,
+                ),
+                (true, true, false) | (false, false, true)
+            ),
+            "status-delete requires either the exact publication receipt and SHA-256 or --latest-status-publication-receipt"
         );
         ensure!(
             !delete_local && !overwrite_existing && !repair_orphaned_archive && !legacy_etag_only,
             "archive mutation/legacy options are invalid with status-delete"
         );
-        ensure!(
-            is_lower_hex(status_publication_sha256.as_deref().expect("checked"), 64),
-            "--status-publication-sha256 must be 64 lowercase hexadecimal characters"
-        );
+        if let Some(status_publication_sha256) = status_publication_sha256.as_deref() {
+            ensure!(
+                is_lower_hex(status_publication_sha256, 64),
+                "--status-publication-sha256 must be 64 lowercase hexadecimal characters"
+            );
+        }
     }
     let epochs = match (command, epochs) {
         (Command::Inventory, None) => bail!("inventory requires --epochs START-END"),
@@ -534,6 +543,7 @@ fn parse_args() -> Result<Config> {
         archive_receipt_directory,
         status_publication_receipt,
         status_publication_sha256,
+        latest_status_publication_receipt,
     })
 }
 
@@ -1630,8 +1640,20 @@ fn read_bound_status_publication_receipt(
         actual_sha256 == expected_sha256,
         "status publication receipt SHA-256 mismatch"
     );
+    let receipt =
+        validate_status_publication_receipt_bytes(directory, path, &bytes, bucket, epoch)?;
+    Ok((receipt, actual_sha256))
+}
+
+fn validate_status_publication_receipt_bytes(
+    directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+    bucket: &str,
+    epoch: u64,
+) -> Result<StatusPublicationReceipt> {
     let receipt: StatusPublicationReceipt =
-        serde_json::from_slice(&bytes).context("invalid status publication receipt JSON")?;
+        serde_json::from_slice(bytes).context("invalid status publication receipt JSON")?;
     ensure!(
         receipt.schema == STATUS_RECEIPT_SCHEMA,
         "unsupported status publication receipt schema"
@@ -1661,7 +1683,43 @@ fn read_bound_status_publication_receipt(
         path == status_receipt_path(directory, &receipt.status),
         "status publication receipt path is noncanonical"
     );
-    Ok((receipt, actual_sha256))
+    Ok(receipt)
+}
+
+fn latest_status_publication_receipt(
+    directory: &Path,
+    bucket: &str,
+    epoch: u64,
+) -> Result<(StatusPublicationReceipt, PathBuf, String)> {
+    let prefix = format!("epoch-{epoch}.status-");
+    let mut latest: Option<(StatusPublicationReceipt, PathBuf, String)> = None;
+    for entry in fs::read_dir(directory).with_context(|| {
+        format!(
+            "failed to read status receipt directory {}",
+            directory.display()
+        )
+    })? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !name.ends_with(".json") {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = read_stable_bounded(&path, MAX_STATUS_BYTES, "status publication receipt")?;
+        let receipt =
+            validate_status_publication_receipt_bytes(directory, &path, &bytes, bucket, epoch)?;
+        let digest = hex_lower(&Sha256::digest(&bytes));
+        if latest.as_ref().is_none_or(|(current, _, _)| {
+            current.status.sampled_at_utc < receipt.status.sampled_at_utc
+        }) {
+            latest = Some((receipt, path, digest));
+        }
+    }
+    latest
+        .ok_or_else(|| anyhow!("no canonical status publication receipt exists for epoch {epoch}"))
 }
 
 async fn validate_authenticated_ready_pair(
@@ -1688,20 +1746,26 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
         .receipt_directory
         .as_deref()
         .expect("status-delete requires receipt directory");
-    let status_publication_receipt = config
-        .status_publication_receipt
-        .as_deref()
-        .expect("validated");
-    let (publication, publication_sha256) = read_bound_status_publication_receipt(
-        status_receipt_directory,
-        status_publication_receipt,
-        config
-            .status_publication_sha256
-            .as_deref()
-            .expect("validated"),
-        &r2.bucket,
-        epoch,
-    )?;
+    let (publication, status_publication_receipt, publication_sha256) =
+        if config.latest_status_publication_receipt {
+            latest_status_publication_receipt(status_receipt_directory, &r2.bucket, epoch)?
+        } else {
+            let path = config
+                .status_publication_receipt
+                .as_deref()
+                .expect("validated");
+            let (publication, digest) = read_bound_status_publication_receipt(
+                status_receipt_directory,
+                path,
+                config
+                    .status_publication_sha256
+                    .as_deref()
+                    .expect("validated"),
+                &r2.bucket,
+                epoch,
+            )?;
+            (publication, path.to_path_buf(), digest)
+        };
 
     let archive_receipt_directory = config
         .archive_receipt_directory
@@ -1796,7 +1860,7 @@ async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) 
         key,
         deleted_object_etag: publication.object_etag,
         deleted_status: publication.status,
-        status_publication_receipt: status_publication_receipt.to_path_buf(),
+        status_publication_receipt,
         status_publication_receipt_sha256: publication_sha256,
         archive_receipt: archive_receipt_path,
         archive_receipt_sha256,
@@ -3254,6 +3318,17 @@ mod tests {
             read_bound_status_publication_receipt(directory.path(), &path, &digest, "other", 218,)
                 .is_err()
         );
+
+        let mut newer = receipt.clone();
+        newer.status.sampled_at_utc = "2026-10-17T01:40:00Z".to_owned();
+        newer.object_etag = "newer-etag".to_owned();
+        let newer_path = write_status_receipt(directory.path(), &newer).unwrap();
+        let newer_digest = hex_lower(&Sha256::digest(fs::read(&newer_path).unwrap()));
+        let (latest, latest_path, latest_digest) =
+            latest_status_publication_receipt(directory.path(), "bucket", 218).unwrap();
+        assert_eq!(latest, newer);
+        assert_eq!(latest_path, newer_path);
+        assert_eq!(latest_digest, newer_digest);
     }
 
     #[test]
