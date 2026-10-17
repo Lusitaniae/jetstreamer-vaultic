@@ -9,10 +9,11 @@
 //! Records are ordered by slot, starting at the epoch's first slot; skipped slots are encoded
 //! as an all-zero record. This is the primary index used for slot lookups.
 //!
-//! When the slot-ranges file is missing (e.g. an older mirror), the loader falls back to the
-//! legacy compactindex pair (`slot-to-cid` + `cid-to-offset-and-size`). Those indexes are
-//! deprecated upstream and will eventually stop being generated. The fallback derives the same
-//! byte-range semantics as the slot-ranges index, so lookups behave identically on both paths.
+//! When the slot-ranges file is missing (e.g. an older mirror), or remains rate-limited or
+//! unavailable after the bounded retry policy, the loader falls back to the legacy compactindex
+//! pair (`slot-to-cid` + `cid-to-offset-and-size`). Those indexes are deprecated upstream and will
+//! eventually stop being generated. The fallback derives the same byte-range semantics as the
+//! slot-ranges index, so lookups behave identically on both paths.
 //!
 //! ## Environment variables
 //!
@@ -300,6 +301,17 @@ impl EpochEntry {
     }
 }
 
+fn slot_ranges_error_allows_legacy_fallback(error: &SlotOffsetIndexError) -> bool {
+    matches!(
+        error,
+        SlotOffsetIndexError::EpochIndexFileNotFound(_)
+            | SlotOffsetIndexError::HttpStatusError(
+                _,
+                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+            )
+    )
+}
+
 impl SlotOffsetIndex {
     /// Constructs a new [`SlotOffsetIndex`] rooted at the provided base URL.
     ///
@@ -355,11 +367,11 @@ impl SlotOffsetIndex {
         if !self.force_legacy {
             match self.load_slot_ranges_index(epoch).await {
                 Ok(index) => return Ok(EpochIndexes::SlotRanges(index)),
-                Err(SlotOffsetIndexError::EpochIndexFileNotFound(url)) => {
+                Err(err) if slot_ranges_error_allows_legacy_fallback(&err) => {
                     warn!(
                         target: LOG_MODULE,
-                        "slot-ranges index not found at {url}; falling back to legacy compact \
-                         indexes (deprecated upstream)"
+                        "slot-ranges index unavailable after its bounded fetch policy ({err}); \
+                         falling back to legacy compact indexes (deprecated upstream)"
                     );
                 }
                 Err(err) => return Err(err),
@@ -1985,6 +1997,28 @@ mod tests {
         assert!(matches!(
             SlotRangesIndex::from_file(file, 1000..=1002),
             Err(SlotOffsetIndexError::IndexFormatError(..))
+        ));
+    }
+
+    #[test]
+    fn test_legacy_fallback_accepts_only_missing_or_exhausted_transient_statuses() {
+        let url = Url::parse("https://example.com/195/epoch-195-slot-ranges.raw").unwrap();
+
+        assert!(slot_ranges_error_allows_legacy_fallback(
+            &SlotOffsetIndexError::EpochIndexFileNotFound(url.clone())
+        ));
+        assert!(slot_ranges_error_allows_legacy_fallback(
+            &SlotOffsetIndexError::HttpStatusError(url.clone(), StatusCode::TOO_MANY_REQUESTS,)
+        ));
+        assert!(slot_ranges_error_allows_legacy_fallback(
+            &SlotOffsetIndexError::HttpStatusError(url.clone(), StatusCode::SERVICE_UNAVAILABLE,)
+        ));
+
+        assert!(!slot_ranges_error_allows_legacy_fallback(
+            &SlotOffsetIndexError::HttpStatusError(url.clone(), StatusCode::FORBIDDEN)
+        ));
+        assert!(!slot_ranges_error_allows_legacy_fallback(
+            &SlotOffsetIndexError::IndexFormatError(url, "corrupt index".into())
         ));
     }
 
