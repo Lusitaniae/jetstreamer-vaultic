@@ -13,24 +13,17 @@ verification evidence identifies that remote archive as erroneous and the user e
 authorizes its replacement; a mismatch alone does not establish which copy is wrong.
 
 Cloudflare R2 public access is a bucket-level origin setting, not an S3 object ACL. R2 does not
-support `public-read`, `PutObjectAcl`, or the `x-amz-acl` upload header. Never claim that an object is
-public because an ACL call was attempted or because an authenticated S3 read succeeded. Keep the
-authenticated S3 API endpoint in `HORIZON_S3_ENDPOINT`, and configure a distinct
-`HORIZON_PUBLIC_BASE_URL` containing the bucket's enabled `r2.dev` hostname or custom domain. A
-`*.r2.cloudflarestorage.com` S3 API hostname is invalid as the public base URL, even when its path
-names the bucket. Publication is complete only after anonymous HTTPS GETs through the public base
-URL prove both `epoch-N.jet` and `epoch-N.jet.sha256` readable. Use a bounded range GET for the
-archive and a complete GET for the small sidecar; require the public archive length and canonical
-sidecar bytes to agree with the authenticated R2 and local evidence. Public verification must send
-no Authorization, cookie, signed query, or Cloudflare Access credential.
+support `public-read`, `PutObjectAcl`, or the `x-amz-acl` upload header. Keep the authenticated S3
+API endpoint in `HORIZON_S3_ENDPOINT`. Do not rewrite objects or attempt per-object ACL changes to
+make them public. Anonymous-origin verification is not part of this workflow and must not delay
+authenticated upload, completion, status cleanup, or local retirement.
 
 Interpret an explicit request to make or mark all `.jet` archives and sidecars public as authority
 to enable the named bucket's managed `r2.dev` origin or named custom domain once. It is not authority
 to rewrite objects, change metadata, attempt unsupported per-object ACLs, or expose a different
-bucket. After enablement, inventory every storage-complete pair and run anonymous public verification
-for every pair; the bucket-level origin also covers future uploads, which must pass the same public
-gate. If the supplied control-plane credential cannot inspect or enable that origin, preserve all
-objects, report the permission blocker, and leave public delivery incomplete.
+bucket. The bucket-level setting covers both existing and future objects. If the supplied
+control-plane credential cannot inspect or enable that origin, preserve all objects and report the
+permission blocker without holding up the authenticated archive campaign.
 
 Use the repository's `jetstreamer-r2` binary for upload and remote proof. Do not reimplement its multipart protocol in shell or Python. R2's S3 `UploadPart` currently rejects its advertised SHA-256 header, so the binary uses R2-enforced `Content-MD5`, checks the multipart ETag independently, and reads the completed remote object back while computing its whole-file SHA-256. It must fully upload, complete, read back, and revalidate the `.jet` before it uploads the canonical `.sha256` sidecar. It then reads the sidecar back and fsyncs a private receipt before optional local retirement. Treat presence of the matching sidecar as the remote readiness commit marker; an archive without one is staged, and a sidecar without an archive or whose digest does not match the archive is an error. If R2 begins returning native composite SHA-256 evidence, the binary validates and prefers it.
 
@@ -178,9 +171,7 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
 - Use `HORIZON_DIR` when set; otherwise use `$HOME/horizon`. Keep only `epoch-N.jet` and `epoch-N.jet.sha256` in that public directory.
 - Authenticated storage credentials are `HORIZON_S3_ENDPOINT`, `HORIZON_ACCESS_KEY_ID`, and
   `HORIZON_SECRET_ACCESS_KEY`. Check only that they exist; never print their values. The S3
-  endpoint path names the bucket. Public delivery additionally requires
-  `HORIZON_PUBLIC_BASE_URL`, which names the separately enabled `r2.dev` or custom-domain origin
-  and must not be derived by appending an object key to `HORIZON_S3_ENDPOINT`.
+  endpoint path names the bucket.
 - With an explicit user range, restrict ordinary generation, verification, upload, and cleanup to
   that range; the only permitted out-of-range work is the isolated verification tail below.
 - Treat the explicit range end as the publication boundary even when a sealed verification cohort
@@ -194,9 +185,7 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   `verification-tail-private`; never rely on an operator remembering an unrecorded boundary.
 - Without a range, inventory canonical R2 pairs first. Upload any complete local pairs missing from R2, then begin with the lowest missing epoch supported by the repository's compatibility manifests. Continue with disjoint singleton epochs in parallel as fresh admission permits.
 - An R2 epoch is storage-complete only when both `epoch-N.jet` and `epoch-N.jet.sha256` exist and
-  agree with verified local evidence. A checksum-only or archive-only epoch is incomplete. It is
-  publication-complete only when that exact pair also passes the anonymous public-origin checks
-  above. Authenticated `ready-pair` inventory is not public-access evidence.
+  agree with verified local evidence. A checksum-only or archive-only epoch is incomplete.
 - Use the repository binary's mutation-free inventory mode for an authoritative explicit-range
   census: `jetstreamer-r2 inventory "$HORIZON_DIR" --epochs START-END`. It issues only archive HEAD
   and sidecar GET requests and reports every epoch in JSON. Treat `ready-pair` as remote presence
@@ -797,32 +786,6 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
 
 Build once with `cargo build --release -p jetstreamer-r2 -p jetstreamer-r2-progressive`. Store receipts outside the public archive directory, normally at `$HOME/.jetstreamer-private/r2-receipts`.
 
-Before publishing or retiring any pair, confirm the bucket has an enabled public origin through the
-Cloudflare control plane and record its exact hostname. This is one bucket setting that covers all
-current and future objects; do not rewrite objects or attempt per-object ACL changes. Require the
-delivery path to anonymously read both object keys through `HORIZON_PUBLIC_BASE_URL` after the
-sidecar is committed and before its durable publication receipt is accepted. For an existing
-authenticated `ready-pair`, run the same anonymous checks and write separate no-clobber public-read
-evidence before treating it as publicly delivered. If the control-plane credential is unavailable,
-or the only supplied URL is the authenticated `r2.cloudflarestorage.com` S3 endpoint, stop with the
-bucket-publication step incomplete and request an enabled `r2.dev` or custom-domain origin; never
-weaken this into a signed URL or authenticated probe.
-
-Use the Rust verifier for the anonymous proof and keep its receipts separate from authenticated R2
-receipts:
-
-```sh
-target/release/jetstreamer-r2 public-verify "$HORIZON_DIR" \
-  --epochs START-END \
-  --public-receipt-directory "$HOME/.jetstreamer-private/public-r2-receipts"
-```
-
-The command is mutation-free, requires an explicit range, rejects the authenticated S3 hostname,
-disables redirects, and writes one no-clobber receipt only after the public archive range and full
-sidecar agree with authenticated R2. Treat a differing pre-existing public-read receipt as an
-incident; never overwrite it. Do not retire a local pair until both its authenticated R2 receipt and
-matching public-read receipt exist and a fresh anonymous check still succeeds.
-
 For all complete local pairs:
 
 ```sh
@@ -835,19 +798,15 @@ Add `--epochs START-END` for an explicit range. Add `--delete-local` only after 
 
 After an adaptive controller has been deliberately deployed with `--r2-receipt-directory`, its completed cohorts no longer need a matching `--defer-epochs` entry: the progressive uploader may retire them after all normal publication gates pass. Never remove the defer for a controller that lacks this flag.
 
-For progressive delivery and retirement, pass the authenticated and public-read receipt
-directories and explicitly defer every active controller range. The coordinator always performs
-authenticated sync without deletion first, then invokes `jetstreamer-r2 public-verify` for the
-same epoch. A missing or unavailable public origin leaves that epoch pending but does not prevent
-authenticated uploads for other eligible epochs. It may delegate `--delete-local` only after the
-fresh anonymous check succeeds and the matching public-read receipt agrees with the authenticated
-R2 receipt:
+For progressive delivery and retirement, pass the authenticated receipt directory and explicitly
+defer every active controller range. The coordinator performs authenticated sync and remote
+readback first. Delegate `--delete-local` only after the authenticated receipt agrees with the
+current remote pair and the normal local full/plugin/boundary gates pass:
 
 ```sh
 /absolute/immutable/bin/jetstreamer-r2-progressive \
   /absolute/immutable/bin/jetstreamer-r2 "$HORIZON_DIR" \
   "$HOME/.jetstreamer-private/r2-receipts" START END \
-  --public-receipt-directory "$HOME/.jetstreamer-private/public-r2-receipts" \
   --delete-local \
   --local-mutation-lock "$HOME/.jetstreamer-private/r2-receipts/local-mutation.lock" \
   --full-receipt-directory "$HOME/.jetstreamer-private/final-audits/receipts" \
@@ -972,8 +931,6 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   archive, sidecar, receipt, or any other key.
 - Never use `--overwrite-existing` without both positive evidence that the existing remote `.jet` is erroneous and explicit user authorization for its replacement.
 - Upload the sidecar only after the complete `.jet` has passed remote readback and local source revalidation; the matching sidecar is the readiness marker.
-- Require an anonymous public-origin read of both the `.jet` and its sidecar after sidecar
-  publication. A private S3 `ready-pair` is not sufficient for publication or local retirement.
 - Never remove a local archive before its durable receipt exists and both remote objects have been re-observed.
 - Refuse to begin upload without exact full and current-plugin receipts. Refuse local retirement without both adjacent-boundary receipts as well.
 - Do not treat a sidecar alone as proof that the archive was uploaded.
