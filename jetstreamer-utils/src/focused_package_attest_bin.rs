@@ -410,16 +410,25 @@ fn validate_receipt_path(path: &Path, epoch: u64) -> Result<()> {
     Ok(())
 }
 
+fn canonical_package_path(epoch: u64) -> String {
+    // Epochs 207 and 209 were resealed after their original packages were found
+    // to carry obsolete complete-span evidence. Keep that correction narrowly
+    // allowlisted so a plan cannot select an arbitrary package revision.
+    let revision = if matches!(epoch, 207 | 209) {
+        "v2"
+    } else {
+        "v1"
+    };
+    format!("/var/lib/jetstreamer/horizon-focused-{epoch}-complete-span-store8-ca2e38b-{revision}")
+}
+
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
         (203..=212).contains(&plan.epoch),
         "epoch outside approved focused range"
     );
-    let expected_package = format!(
-        "/var/lib/jetstreamer/horizon-focused-{}-complete-span-store8-ca2e38b-v1",
-        plan.epoch
-    );
+    let expected_package = canonical_package_path(plan.epoch);
     ensure!(
         plan.package.to_str() == Some(&expected_package),
         "non-canonical package path"
@@ -867,6 +876,30 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn valid_plan(epoch: u64) -> Plan {
+        let epoch_end_slot = (epoch + 1) * EPOCH_SLOTS - 1;
+        Plan {
+            schema: PLAN_SCHEMA.to_string(),
+            epoch,
+            package: canonical_package_path(epoch).into(),
+            source_snapshot: format!("/private/snapshot-{epoch}-test.tar.zst").into(),
+            snapshot_name: format!("snapshot-{epoch}-test.tar.zst"),
+            snapshot_sha256: "a".repeat(64),
+            checkpoint_name: format!("epoch-hashes-{epoch}-complete-span.txt"),
+            checkpoint_sha256: "b".repeat(64),
+            sha256sums_sha256: "c".repeat(64),
+            deployment_receipt_sha256: "d".repeat(64),
+            manifest_sha256: "e".repeat(64),
+            epoch_end_slot,
+            terminal_root_slot: epoch_end_slot + 1,
+            successor_tail_slots: 1,
+            receipt: format!(
+                "/home/ubuntu/.jetstreamer-private/campaign-state/epoch{epoch}-complete-span-store8-immutable-package-ca2e38b-test.json"
+            )
+            .into(),
+        }
+    }
+
     #[test]
     fn digest_validation_is_lowercase_only() {
         assert!(is_sha256(&"a".repeat(64)));
@@ -877,23 +910,32 @@ mod tests {
 
     #[test]
     fn plan_rejects_noncanonical_tail() {
-        let plan = Plan {
-            schema: PLAN_SCHEMA.to_string(),
-            epoch: 210,
-            package: "/var/lib/jetstreamer/horizon-focused-210-complete-span-store8-ca2e38b-v1".into(),
-            source_snapshot: "/private/snapshot-90719638-test.tar.zst".into(),
-            snapshot_name: "snapshot-90719638-test.tar.zst".to_string(),
-            snapshot_sha256: "a".repeat(64),
-            checkpoint_name: "epoch-hashes-210-complete-span.txt".to_string(),
-            checkpoint_sha256: "b".repeat(64),
-            sha256sums_sha256: "c".repeat(64),
-            deployment_receipt_sha256: "d".repeat(64),
-            manifest_sha256: "e".repeat(64),
-            epoch_end_slot: 91_151_999,
-            terminal_root_slot: 91_583_512,
-            successor_tail_slots: 1,
-            receipt: "/home/ubuntu/.jetstreamer-private/campaign-state/epoch210-complete-span-store8-immutable-package-ca2e38b-test.json".into(),
-        };
+        let mut plan = valid_plan(210);
+        plan.successor_tail_slots = 2;
         assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn corrected_package_revisions_are_narrowly_allowlisted() {
+        assert_eq!(
+            canonical_package_path(207),
+            "/var/lib/jetstreamer/horizon-focused-207-complete-span-store8-ca2e38b-v2"
+        );
+        assert_eq!(
+            canonical_package_path(209),
+            "/var/lib/jetstreamer/horizon-focused-209-complete-span-store8-ca2e38b-v2"
+        );
+        assert!(validate_plan(&valid_plan(207)).is_ok());
+        assert!(validate_plan(&valid_plan(209)).is_ok());
+
+        let mut obsolete_207 = valid_plan(207);
+        obsolete_207.package =
+            "/var/lib/jetstreamer/horizon-focused-207-complete-span-store8-ca2e38b-v1".into();
+        assert!(validate_plan(&obsolete_207).is_err());
+
+        let mut unapproved_205 = valid_plan(205);
+        unapproved_205.package =
+            "/var/lib/jetstreamer/horizon-focused-205-complete-span-store8-ca2e38b-v2".into();
+        assert!(validate_plan(&unapproved_205).is_err());
     }
 }
