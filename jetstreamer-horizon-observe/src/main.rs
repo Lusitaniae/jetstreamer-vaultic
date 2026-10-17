@@ -24,7 +24,7 @@ use {
     },
 };
 
-const CONFIG_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-config-v1";
+const CONFIG_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-config-v2";
 const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PREVIOUS_SAMPLE_BYTES: u64 = 4 * 1024 * 1024;
@@ -1450,6 +1450,15 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observer_config_and_output_schemas_are_v2() {
+        assert_eq!(
+            CONFIG_SCHEMA,
+            "jetstreamer-horizon-live-resource-sample-config-v2"
+        );
+        assert_eq!(OUTPUT_SCHEMA, "jetstreamer-horizon-live-resource-sample-v2");
+    }
 
     #[test]
     fn timestamp_round_trip_known_values() {

@@ -99,8 +99,8 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   anonymous origin. Never let status-object permissions or failures weaken the archive/sidecar
   gates.
 - Use the Rust uploader's `status-publish` command once per claimed epoch immediately after the
-  coordinated observer receipt is durable. Pass the exact directory containing that epoch's current
-  partial `.jet`; the command reports size `0` when the file has not begun. It verifies the observer
+  coordinated v2 observer receipt is durable. Pass the exact directory containing that epoch's
+  current partial `.jet`; the command reports size `0` when the file has not begun. It verifies the observer
   receipt SHA-256, stable zero-restart controller/producer IDs, and epoch claim, derives
   `sampled_at_utc` from that receipt, conditionally creates or replaces only the canonical status
   key, performs authenticated byte-for-byte readback, and fsyncs a private receipt:
@@ -505,6 +505,12 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   retry inside the cadence window. The sample is resource evidence only: combine it with current
   invocation-bound guard receipts and the complete reserve/admission arithmetic before launching a
   new replay or lowering an external remaining-growth claim.
+  Standardize every newly authored observer deployment on v2 end to end: require config schema
+  `jetstreamer-horizon-live-resource-sample-config-v2` and output schema
+  `jetstreamer-horizon-live-resource-sample-v2`. Do not author, seal, or install a new v1 observer
+  config or receipt. Preserve historical v1 receipts unchanged and allow the last one only as the
+  cadence predecessor for the first v2 sample; a v1 receipt is never valid status-publication,
+  throughput, scaling, or fresh-admission evidence.
 - For pinned legacy Solana workers, record the visible CPU count and the effective
   `SOLANA_RAYON_THREADS` value. When unset, the old thread-limit crate defaults to half of visible
   CPUs, and AccountsDb also uses that value as its minimum store fan-out; a high-core host can
