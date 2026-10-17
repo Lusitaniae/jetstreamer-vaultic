@@ -488,6 +488,18 @@ fn parse_epoch_range(value: &str) -> Result<BTreeSet<u64>> {
     Ok((first..=last).collect())
 }
 
+fn parse_observer_claim_range(value: &str) -> Result<BTreeSet<u64>> {
+    if value.contains('-') {
+        return parse_epoch_range(value);
+    }
+    let epoch: u64 = value.parse().context("invalid observer epoch claim")?;
+    ensure!(
+        value == epoch.to_string(),
+        "observer singleton epoch claim is not canonical"
+    );
+    Ok(BTreeSet::from([epoch]))
+}
+
 fn parse_mib(value: &str) -> Result<u64> {
     let mib: u64 = value.parse().context("invalid MiB value")?;
     ensure!(
@@ -1173,7 +1185,7 @@ fn validate_observer_binding(
         replay
             .get("range")
             .and_then(Value::as_str)
-            .and_then(|range| parse_epoch_range(range).ok())
+            .and_then(|range| parse_observer_claim_range(range).ok())
             .is_some_and(|epochs| epochs.contains(&epoch))
     });
     let replay = matches
@@ -2706,6 +2718,32 @@ mod tests {
             "2026-10-17T01:10:00Z"
         );
         assert!(validate_observer_binding(&bytes, &digest, 220, &controller, &producer).is_err());
+
+        let mut singleton_observer = observer.clone();
+        singleton_observer["replays"][0]["range"] = Value::from("218");
+        let singleton_bytes = serde_json::to_vec(&singleton_observer).unwrap();
+        let singleton_digest = hex_lower(&Sha256::digest(&singleton_bytes));
+        assert_eq!(
+            validate_observer_binding(
+                &singleton_bytes,
+                &singleton_digest,
+                218,
+                &controller,
+                &producer
+            )
+            .unwrap(),
+            "2026-10-17T01:10:00Z"
+        );
+        assert!(
+            validate_observer_binding(
+                &singleton_bytes,
+                &singleton_digest,
+                219,
+                &controller,
+                &producer
+            )
+            .is_err()
+        );
 
         let exact = br#"{
             "epoch": 218,
