@@ -9,6 +9,10 @@ repository.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 
+[[bin]]
+name = "jetstreamer-horizon-status-estimate"
+path = "src/status_estimate.rs"
+
 [dependencies]
 anyhow.workspace = true
 libc.workspace = true
