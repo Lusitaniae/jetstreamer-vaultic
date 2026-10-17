@@ -112,6 +112,7 @@ struct UnitObservation {
 #[derive(Clone, Debug, Serialize)]
 struct CgroupObservation {
     path: PathBuf,
+    io_counters_available: bool,
     gauges: BTreeMap<String, Option<u64>>,
     counters: BTreeMap<String, u64>,
 }
@@ -682,6 +683,40 @@ fn parse_io_stat(path: &Path) -> Result<BTreeMap<String, u64>> {
     Ok(counters)
 }
 
+fn observe_io_counters(cgroup: &Path) -> Result<(bool, BTreeMap<String, u64>)> {
+    let path = cgroup.join("io.stat");
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file(),
+                "cgroup I/O counters are not a regular file"
+            );
+            Ok((true, parse_io_stat(&path)?))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = cgroup
+                .parent()
+                .ok_or_else(|| anyhow!("cgroup has no parent"))?;
+            let subtree_control = fs::read_to_string(parent.join("cgroup.subtree_control"))
+                .with_context(|| {
+                    format!(
+                        "failed to read parent cgroup controller delegation for {}",
+                        cgroup.display()
+                    )
+                })?;
+            ensure!(
+                !subtree_control
+                    .split_whitespace()
+                    .any(|value| value == "io"),
+                "cgroup I/O controller is delegated but io.stat is missing"
+            );
+            Ok((false, BTreeMap::new()))
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed to inspect cgroup I/O counters {}", path.display())),
+    }
+}
+
 fn split_memory_stat(
     values: BTreeMap<String, u64>,
 ) -> (BTreeMap<String, Option<u64>>, BTreeMap<String, u64>) {
@@ -720,9 +755,11 @@ fn observe_cgroup(control_group: &str) -> Result<CgroupObservation> {
     ] {
         counters.extend(parse_pressure_file(&path.join(filename), prefix)?);
     }
-    counters.extend(parse_io_stat(&path.join("io.stat"))?);
+    let (io_counters_available, io_counters) = observe_io_counters(&path)?;
+    counters.extend(io_counters);
     Ok(CgroupObservation {
         path,
+        io_counters_available,
         gauges,
         counters,
     })
@@ -1094,6 +1131,7 @@ fn stable_unit(before: &UnitObservation, after: &UnitObservation) -> bool {
     before.invocation_id == after.invocation_id
         && before.control_group == after.control_group
         && before.cgroup.path == after.cgroup.path
+        && before.cgroup.io_counters_available == after.cgroup.io_counters_available
         && before.restarts == 0
         && after.restarts == 0
         && after.load_state == "loaded"
@@ -1593,6 +1631,30 @@ mod tests {
     }
 
     #[test]
+    fn absent_io_stat_is_allowed_only_without_parent_delegation() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("parent");
+        let cgroup = parent.join("service");
+        fs::create_dir_all(&cgroup).unwrap();
+        fs::write(parent.join("cgroup.subtree_control"), "cpu memory pids\n").unwrap();
+        let (available, counters) = observe_io_counters(&cgroup).unwrap();
+        assert!(!available);
+        assert!(counters.is_empty());
+
+        fs::write(
+            parent.join("cgroup.subtree_control"),
+            "cpu io memory pids\n",
+        )
+        .unwrap();
+        assert!(
+            observe_io_counters(&cgroup)
+                .unwrap_err()
+                .to_string()
+                .contains("delegated but io.stat is missing")
+        );
+    }
+
+    #[test]
     fn progress_window_reports_useful_work_and_counter_resets() {
         let points = vec![
             parse_progress_point(
@@ -1684,6 +1746,7 @@ mod tests {
             control_group: PathBuf::from("/system.slice/producer.service"),
             cgroup: CgroupObservation {
                 path: PathBuf::from("/sys/fs/cgroup/system.slice/producer.service"),
+                io_counters_available: true,
                 gauges: BTreeMap::new(),
                 counters: BTreeMap::from([
                     ("cpu.usage_usec".to_owned(), 3_601_000_000),
