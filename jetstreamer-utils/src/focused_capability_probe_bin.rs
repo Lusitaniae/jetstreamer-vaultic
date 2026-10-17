@@ -690,7 +690,7 @@ fn process_references(probe_root: &Path, worker: &Path) -> Result<Vec<String>> {
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
-        (206..=212).contains(&plan.epoch),
+        (203..=212).contains(&plan.epoch),
         "epoch outside focused capability range"
     );
     ensure!(
@@ -717,14 +717,14 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         plan.package.to_str() == Some(expected_package.as_str()),
         "package path is not canonical for the epoch"
     );
-    let expected_package_receipt = format!(
-        "/home/ubuntu/.jetstreamer-private/campaign-state/epoch{}-complete-span-store8-immutable-package-ca2e38b-20261016-v1.json",
-        plan.epoch
-    );
-    ensure!(
-        plan.package_receipt.to_str() == Some(expected_package_receipt.as_str()),
-        "package receipt path is not canonical for the epoch"
-    );
+    validate_campaign_receipt_path(
+        &plan.package_receipt,
+        &format!(
+            "epoch{}-complete-span-store8-immutable-package-ca2e38b-",
+            plan.epoch
+        ),
+    )
+    .context("package receipt path is not canonical for the epoch")?;
     let expected_probe_root = format!(
         "/home/ubuntu/.jetstreamer-private/qualification-{}/package-capability-probe-rust-ca2e38b-v{}",
         plan.epoch, plan.probe_attempt
@@ -733,14 +733,14 @@ fn validate_plan(plan: &Plan) -> Result<()> {
         plan.probe_root.to_str() == Some(expected_probe_root.as_str()),
         "probe root is not canonical for the epoch"
     );
-    let expected_receipt = format!(
-        "/home/ubuntu/.jetstreamer-private/campaign-state/epoch{}-complete-span-package-capability-ca2e38b-rust-20261016-v1.json",
-        plan.epoch
-    );
-    ensure!(
-        plan.receipt.to_str() == Some(expected_receipt.as_str()),
-        "receipt path is not canonical for the epoch"
-    );
+    validate_campaign_receipt_path(
+        &plan.receipt,
+        &format!(
+            "epoch{}-complete-span-package-capability-ca2e38b-rust-",
+            plan.epoch
+        ),
+    )
+    .context("receipt path is not canonical for the epoch")?;
     ensure!(
         plan.run_uid == 1000 && plan.run_gid == 1000,
         "unexpected probe identity"
@@ -772,6 +772,33 @@ fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(
         plan.checkpoint_name == format!("epoch-hashes-{}-complete-span.txt", plan.epoch),
         "checkpoint filename is not canonical"
+    );
+    Ok(())
+}
+
+fn validate_campaign_receipt_path(path: &Path, prefix: &str) -> Result<()> {
+    ensure!(
+        path.parent()
+            == Some(Path::new(
+                "/home/ubuntu/.jetstreamer-private/campaign-state"
+            )),
+        "unexpected receipt parent"
+    );
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid receipt filename")?;
+    ensure!(
+        name.starts_with(prefix) && name.ends_with(".json"),
+        "unexpected receipt filename"
+    );
+    let suffix = &name[prefix.len()..name.len() - ".json".len()];
+    ensure!(
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "invalid receipt filename suffix"
     );
     Ok(())
 }
@@ -1093,6 +1120,34 @@ mod tests {
         validate_plan(&plan).unwrap();
         plan.terminal_slot = MAX_SLOT_EXCLUSIVE;
         assert!(validate_plan(&plan).is_err());
+    }
+
+    #[test]
+    fn accepts_epoch_203_with_unique_receipts() {
+        let mut current = plan();
+        current.epoch = 203;
+        current.bootstrap_slot = 87_695_515;
+        current.terminal_slot = 88_559_361;
+        current.package =
+            "/var/lib/jetstreamer/horizon-focused-203-complete-span-store8-ca2e38b-v1".into();
+        current.package_receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-store8-immutable-package-ca2e38b-20261017-v1.json".into();
+        current.snapshot_name =
+            "snapshot-87695515-CYEr1vEwJyh2d4SSmnmYPYYj6EPhrDWTAJJCuzF2VhLX.tar.zst".into();
+        current.checkpoint_name = "epoch-hashes-203-complete-span.txt".into();
+        current.probe_root = "/home/ubuntu/.jetstreamer-private/qualification-203/package-capability-probe-rust-ca2e38b-v5".into();
+        current.probe_attempt = 5;
+        current.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-complete-span-package-capability-ca2e38b-rust-20261017-v1.json".into();
+        validate_plan(&current).unwrap();
+    }
+
+    #[test]
+    fn rejects_noncanonical_receipt_suffixes() {
+        let mut bad = plan();
+        bad.package_receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch209-complete-span-store8-immutable-package-ca2e38b-.json".into();
+        assert!(validate_plan(&bad).is_err());
+        let mut bad = plan();
+        bad.receipt = "/home/ubuntu/.jetstreamer-private/campaign-state/epoch209-complete-span-package-capability-ca2e38b-rust-bad.name.json".into();
+        assert!(validate_plan(&bad).is_err());
     }
 
     #[test]
