@@ -37,6 +37,10 @@ name = "jetstreamer-focused-capability-probe"
 path = "src/focused_capability_probe_bin.rs"
 
 [[bin]]
+name = "jetstreamer-focused-package-attest"
+path = "src/focused_package_attest_bin.rs"
+
+[[bin]]
 name = "jetstreamer-gcs-metadata-observe"
 path = "src/gcs_metadata_observe_bin.rs"
 
