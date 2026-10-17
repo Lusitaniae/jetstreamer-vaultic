@@ -305,7 +305,7 @@ fn read_plan(path: &Path, expected_sha256: &str) -> Result<(Plan, FileIdentity)>
 fn validate_plan(plan: &Plan) -> Result<()> {
     ensure!(plan.schema == PLAN_SCHEMA, "plan schema mismatch");
     ensure!(
-        (209..=212).contains(&plan.epoch),
+        (203..=212).contains(&plan.epoch),
         "epoch is outside approved range"
     );
     for digest in [
@@ -326,13 +326,28 @@ fn validate_plan(plan: &Plan) -> Result<()> {
             ),
         "remote object identity is inconsistent"
     );
+    let output_parent = plan.output.parent().context("output has no parent")?;
     ensure!(
-        plan.output.to_string_lossy()
-            == format!(
-                "/home/ubuntu/.jetstreamer-private/campaign-state/epoch{}-gcs-metadata-reobservation-20261016-v1.json",
-                plan.epoch
-            ),
-        "output path is not canonical"
+        output_parent == Path::new("/home/ubuntu/.jetstreamer-private/campaign-state"),
+        "output parent is not canonical"
+    );
+    let output_name = plan
+        .output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("output filename is invalid")?;
+    let output_prefix = format!("epoch{}-gcs-metadata-reobservation-", plan.epoch);
+    ensure!(
+        output_name.starts_with(&output_prefix) && output_name.ends_with(".json"),
+        "output filename is not canonical"
+    );
+    let output_suffix = &output_name[output_prefix.len()..output_name.len() - ".json".len()];
+    ensure!(
+        !output_suffix.is_empty()
+            && output_suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "output filename suffix is invalid"
     );
     Ok(())
 }
@@ -682,8 +697,31 @@ mod tests {
         bad.epoch = 213;
         assert!(validate_plan(&bad).is_err());
         let mut bad = plan();
+        bad.epoch = 202;
+        assert!(validate_plan(&bad).is_err());
+        let mut bad = plan();
         bad.output = "/tmp/output.json".into();
         assert!(validate_plan(&bad).is_err());
+        let mut bad = plan();
+        bad.output =
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch211-gcs-metadata-reobservation-.json"
+                .into();
+        assert!(validate_plan(&bad).is_err());
+        let mut bad = plan();
+        bad.output =
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch211-gcs-metadata-reobservation-bad.name.json"
+                .into();
+        assert!(validate_plan(&bad).is_err());
+    }
+
+    #[test]
+    fn accepts_epoch_203_and_unique_canonical_output() {
+        let mut current = plan();
+        current.epoch = 203;
+        current.output =
+            "/home/ubuntu/.jetstreamer-private/campaign-state/epoch203-gcs-metadata-reobservation-20261017T042500Z-v1.json"
+                .into();
+        validate_plan(&current).unwrap();
     }
 
     #[test]
