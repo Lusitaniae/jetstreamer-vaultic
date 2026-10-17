@@ -14,9 +14,11 @@ use {
     },
 };
 
-const MODEL_SCHEMA: &str = "jetstreamer-horizon-r2-status-eta-model-v1";
+const MODEL_SCHEMA_V1: &str = "jetstreamer-horizon-r2-status-eta-model-v1";
+const MODEL_SCHEMA_V2: &str = "jetstreamer-horizon-r2-status-eta-model-v2";
 const OBSERVER_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
-const OUTPUT_SCHEMA: &str = "jetstreamer-horizon-r2-status-estimates-v1";
+const OUTPUT_SCHEMA_V1: &str = "jetstreamer-horizon-r2-status-estimates-v1";
+const OUTPUT_SCHEMA_V2: &str = "jetstreamer-horizon-r2-status-estimates-v2";
 const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -35,6 +37,10 @@ struct Model {
     sample_target_utc: String,
     phase: String,
     status_receipt_directory: PathBuf,
+    #[serde(default)]
+    estimate_receipt_directory: Option<PathBuf>,
+    #[serde(default)]
+    expected_observer_ranges: Vec<String>,
     evidence: Vec<Evidence>,
     rounding: String,
     ranges: Vec<RangeModel>,
@@ -57,9 +63,16 @@ struct RangeModel {
     epochs: Vec<u64>,
     elapsed_execution_millis: u64,
     terminal_slot: u64,
-    current_completion_overhead_seconds: u64,
-    second_epoch_commit_offset_seconds: u64,
-    next_pair_replay_seconds: u64,
+    #[serde(default)]
+    current_completion_overhead_seconds: Option<u64>,
+    #[serde(default)]
+    second_epoch_commit_offset_seconds: Option<u64>,
+    #[serde(default)]
+    next_pair_replay_seconds: Option<u64>,
+    #[serde(default)]
+    downstream_allowance_seconds: Option<u64>,
+    #[serde(default)]
+    epoch_additional_replay_slots: BTreeMap<String, u64>,
     formula: BTreeMap<String, String>,
 }
 
@@ -73,8 +86,12 @@ struct Authority {
 
 #[derive(Debug, Deserialize)]
 struct Validation {
+    #[serde(default)]
+    prior_status_receipts_reproduced: bool,
+    #[serde(default)]
     #[serde(rename = "matches_2026_10_17T04_17_00Z_statuses_within_one_second")]
     matches_2026_10_17_t04_17_00_z_statuses_within_one_second: bool,
+    #[serde(default)]
     #[serde(rename = "reproduces_2026_10_17T04_47_00Z_statuses_exactly")]
     reproduces_2026_10_17_t04_47_00_z_statuses_exactly: bool,
 }
@@ -219,6 +236,17 @@ fn valid_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn parse_range(value: &str) -> Result<BTreeSet<u64>> {
+    let (start, end) = if let Some((start, end)) = value.split_once('-') {
+        (start.parse::<u64>()?, end.parse::<u64>()?)
+    } else {
+        let epoch = value.parse::<u64>()?;
+        (epoch, epoch)
+    };
+    ensure!(start <= end, "invalid modeled range");
+    Ok((start..=end).collect())
+}
+
 fn read_exact(path: &Path, expected_sha256: &str, immutable_root_owned: bool) -> Result<Vec<u8>> {
     ensure!(
         path.is_absolute(),
@@ -273,7 +301,10 @@ fn read_exact(path: &Path, expected_sha256: &str, immutable_root_owned: bool) ->
 }
 
 fn validate_model(model: &Model) -> Result<()> {
-    ensure!(model.schema == MODEL_SCHEMA, "model schema mismatch");
+    ensure!(
+        matches!(model.schema.as_str(), MODEL_SCHEMA_V1 | MODEL_SCHEMA_V2),
+        "model schema mismatch"
+    );
     ensure!(model.phase == "replay", "model phase mismatch");
     ensure!(
         model.status_receipt_directory.is_absolute(),
@@ -295,13 +326,18 @@ fn validate_model(model: &Model) -> Result<()> {
             "model evidence SHA-256 is invalid"
         );
     }
-    ensure!(
-        model
+    let legacy_validation = model
+        .validation
+        .matches_2026_10_17_t04_17_00_z_statuses_within_one_second
+        && model
             .validation
-            .matches_2026_10_17_t04_17_00_z_statuses_within_one_second
-            && model
-                .validation
-                .reproduces_2026_10_17_t04_47_00_z_statuses_exactly,
+            .reproduces_2026_10_17_t04_47_00_z_statuses_exactly;
+    ensure!(
+        if model.schema == MODEL_SCHEMA_V2 {
+            model.validation.prior_status_receipts_reproduced
+        } else {
+            legacy_validation
+        },
         "model validation evidence is incomplete"
     );
     ensure!(
@@ -313,10 +349,35 @@ fn validate_model(model: &Model) -> Result<()> {
             && !model.authority.r2_archive_mutations_authorized,
         "model authority is unsafe"
     );
-    ensure!(
-        model.ranges.len() == 2,
-        "expected exactly two public ranges"
-    );
+    ensure!(!model.ranges.is_empty(), "model has no public ranges");
+    if model.schema == MODEL_SCHEMA_V2 {
+        let estimate_directory = model
+            .estimate_receipt_directory
+            .as_ref()
+            .context("v2 model lacks estimate receipt directory")?;
+        ensure!(
+            estimate_directory.is_absolute(),
+            "estimate receipt directory is not absolute"
+        );
+        ensure!(
+            !model.expected_observer_ranges.is_empty(),
+            "v2 model lacks observer census"
+        );
+        let expected: BTreeSet<_> = model
+            .expected_observer_ranges
+            .iter()
+            .map(String::as_str)
+            .collect();
+        ensure!(
+            expected.len() == model.expected_observer_ranges.len(),
+            "v2 model observer census contains duplicates"
+        );
+    } else {
+        ensure!(
+            model.ranges.len() == 2,
+            "expected exactly two public ranges"
+        );
+    }
     let mut ranges = BTreeSet::new();
     let mut epochs = BTreeSet::new();
     for range in &model.ranges {
@@ -324,15 +385,46 @@ fn validate_model(model: &Model) -> Result<()> {
             ranges.insert(range.range.as_str()),
             "duplicate modeled range"
         );
+        ensure!(!range.epochs.is_empty(), "modeled range has no epochs");
         ensure!(
-            range.epochs.len() == 4,
-            "modeled range must contain four epochs"
+            parse_range(&range.range)? == range.epochs.iter().copied().collect(),
+            "modeled range does not match its epochs"
         );
         ensure!(
             range.archive_directory.is_absolute(),
             "modeled archive directory is not absolute"
         );
-        ensure!(range.formula.len() == 4, "modeled range lacks formulas");
+        if model.schema == MODEL_SCHEMA_V2 {
+            ensure!(
+                range.formula.len() == range.epochs.len(),
+                "modeled range lacks formulas"
+            );
+            ensure!(
+                range.downstream_allowance_seconds.is_some(),
+                "modeled range lacks downstream allowance"
+            );
+            ensure!(
+                range.epoch_additional_replay_slots.len() == range.epochs.len(),
+                "modeled range lacks per-epoch replay offsets"
+            );
+            ensure!(
+                range.current_completion_overhead_seconds.is_none()
+                    && range.second_epoch_commit_offset_seconds.is_none()
+                    && range.next_pair_replay_seconds.is_none(),
+                "v2 model mixes legacy ETA fields"
+            );
+        } else {
+            ensure!(
+                range.epochs.len() == 4,
+                "legacy range must contain four epochs"
+            );
+            ensure!(
+                range.current_completion_overhead_seconds.is_some()
+                    && range.second_epoch_commit_offset_seconds.is_some()
+                    && range.next_pair_replay_seconds.is_some(),
+                "legacy modeled range lacks ETA fields"
+            );
+        }
         ensure!(
             range.expected_controller_invocation_id.len() == 32
                 && range
@@ -352,18 +444,40 @@ fn validate_model(model: &Model) -> Result<()> {
                 range.formula.contains_key(&epoch.to_string()),
                 "missing epoch formula"
             );
+            if model.schema == MODEL_SCHEMA_V2 {
+                ensure!(
+                    range
+                        .epoch_additional_replay_slots
+                        .contains_key(&epoch.to_string()),
+                    "missing epoch replay offset"
+                );
+            }
         }
     }
-    ensure!(
-        epochs == (216..=223).collect(),
-        "model does not cover exactly epochs 216-223"
-    );
+    if model.schema == MODEL_SCHEMA_V1 {
+        ensure!(
+            epochs == (216..=223).collect(),
+            "model does not cover exactly epochs 216-223"
+        );
+    }
+    if model.schema == MODEL_SCHEMA_V2 {
+        let expected: BTreeSet<_> = model
+            .expected_observer_ranges
+            .iter()
+            .map(String::as_str)
+            .collect();
+        ensure!(
+            ranges.iter().all(|range| expected.contains(range)),
+            "modeled range is absent from observer census"
+        );
+    }
     Ok(())
 }
 
 fn estimate_range(
     model: &RangeModel,
     replay: &Replay,
+    model_schema: &str,
 ) -> Result<(RangeOutput, Vec<EpochEstimate>)> {
     ensure!(replay.range == model.range, "range mismatch");
     ensure!(
@@ -410,26 +524,74 @@ fn estimate_range(
         last.slot <= model.terminal_slot,
         "observed slot exceeds terminal"
     );
-    let replay_seconds = (model.terminal_slot - last.slot) as f64 / rate;
-    let first_seconds = (replay_seconds + model.current_completion_overhead_seconds as f64).round();
+    let remaining_slots = model.terminal_slot - last.slot;
+    let first_seconds = if model_schema == MODEL_SCHEMA_V2 {
+        ((remaining_slots as f64 / rate)
+            + model
+                .downstream_allowance_seconds
+                .context("missing downstream allowance")? as f64)
+            .round()
+    } else {
+        ((remaining_slots as f64 / rate)
+            + model
+                .current_completion_overhead_seconds
+                .context("missing current completion overhead")? as f64)
+            .round()
+    };
     ensure!(
         first_seconds.is_finite() && first_seconds >= 0.0,
         "ETA is invalid"
     );
     let first = first_seconds as u64;
-    let values = [
-        first,
-        first
-            .checked_add(model.second_epoch_commit_offset_seconds)
-            .context("ETA overflow")?,
-        first
-            .checked_add(model.next_pair_replay_seconds)
-            .context("ETA overflow")?,
-        first
-            .checked_add(model.next_pair_replay_seconds)
-            .and_then(|value| value.checked_add(model.second_epoch_commit_offset_seconds))
-            .context("ETA overflow")?,
-    ];
+    let values = if model_schema == MODEL_SCHEMA_V2 {
+        model
+            .epochs
+            .iter()
+            .map(|epoch| {
+                let additional_slots = model
+                    .epoch_additional_replay_slots
+                    .get(&epoch.to_string())
+                    .copied()
+                    .context("missing epoch replay offset")?;
+                let seconds = (((remaining_slots
+                    .checked_add(additional_slots)
+                    .context("slot ETA overflow")?) as f64
+                    / rate)
+                    + model
+                        .downstream_allowance_seconds
+                        .context("missing downstream allowance")? as f64)
+                    .round();
+                ensure!(seconds.is_finite() && seconds >= 0.0, "ETA is invalid");
+                Ok(seconds as u64)
+            })
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![
+            first,
+            first
+                .checked_add(
+                    model
+                        .second_epoch_commit_offset_seconds
+                        .context("missing second epoch offset")?,
+                )
+                .context("ETA overflow")?,
+            first
+                .checked_add(
+                    model
+                        .next_pair_replay_seconds
+                        .context("missing next pair replay time")?,
+                )
+                .context("ETA overflow")?,
+            first
+                .checked_add(
+                    model
+                        .next_pair_replay_seconds
+                        .context("missing next pair replay time")?,
+                )
+                .and_then(|value| value.checked_add(model.second_epoch_commit_offset_seconds?))
+                .context("ETA overflow")?,
+        ]
+    };
     let estimates = model
         .epochs
         .iter()
@@ -459,12 +621,13 @@ fn estimate_range(
     ))
 }
 
-fn validate_output_path(path: &Path) -> Result<()> {
+fn validate_output_path(path: &Path, model: &Model) -> Result<()> {
+    let expected_parent = model
+        .estimate_receipt_directory
+        .as_deref()
+        .unwrap_or_else(|| Path::new("/home/ubuntu/workspace/jetstreamer/.codex/tmp-readiness"));
     ensure!(
-        path.parent()
-            == Some(Path::new(
-                "/home/ubuntu/workspace/jetstreamer/.codex/tmp-readiness",
-            )),
+        path.parent() == Some(expected_parent),
         "unexpected output parent"
     );
     let name = path
@@ -503,7 +666,6 @@ fn write_new(path: &Path, bytes: &[u8]) -> Result<String> {
 
 fn run() -> Result<()> {
     let arguments = parse_args()?;
-    validate_output_path(&arguments.output)?;
     let executable = fs::read_link("/proc/self/exe")?;
     read_exact(&executable, &arguments.self_sha256, true)?;
     let model_bytes = read_exact(&arguments.model, &arguments.model_sha256, true)?;
@@ -512,6 +674,18 @@ fn run() -> Result<()> {
     let observer: Observer =
         serde_json::from_slice(&observer_bytes).context("invalid observer JSON")?;
     validate_model(&model)?;
+    validate_output_path(&arguments.output, &model)?;
+    if let Some(estimate_directory) = &model.estimate_receipt_directory {
+        ensure!(
+            estimate_directory.canonicalize()? == *estimate_directory,
+            "estimate receipt directory path is not exact"
+        );
+        let metadata = fs::symlink_metadata(estimate_directory)?;
+        ensure!(
+            metadata.is_dir() && metadata.uid() == 0 && metadata.mode() & 0o7777 == 0o700,
+            "estimate receipt directory identity or mode mismatch"
+        );
+    }
     ensure!(
         model.status_receipt_directory.canonicalize()? == model.status_receipt_directory,
         "status receipt directory path is not exact"
@@ -535,10 +709,23 @@ fn run() -> Result<()> {
         observer.recorded_at_utc == model.sample_target_utc,
         "observer timestamp mismatch"
     );
-    ensure!(
-        observer.replays.len() == 3,
-        "observer replay census mismatch"
-    );
+    if model.schema == MODEL_SCHEMA_V2 {
+        let expected: BTreeSet<_> = model.expected_observer_ranges.iter().collect();
+        let observed: BTreeSet<_> = observer
+            .replays
+            .iter()
+            .map(|replay| &replay.range)
+            .collect();
+        ensure!(
+            expected.len() == model.expected_observer_ranges.len() && expected == observed,
+            "observer replay census mismatch"
+        );
+    } else {
+        ensure!(
+            observer.replays.len() == 3,
+            "observer replay census mismatch"
+        );
+    }
 
     let mut ranges = Vec::new();
     let mut estimates = Vec::new();
@@ -560,13 +747,17 @@ fn run() -> Result<()> {
             matches.len() == 1,
             "observer range is missing or duplicated"
         );
-        let (range, mut range_estimates) = estimate_range(range_model, matches[0])?;
+        let (range, mut range_estimates) = estimate_range(range_model, matches[0], &model.schema)?;
         ranges.push(range);
         estimates.append(&mut range_estimates);
     }
     estimates.sort_by_key(|item| item.epoch);
     let output = Output {
-        schema: OUTPUT_SCHEMA,
+        schema: if model.schema == MODEL_SCHEMA_V2 {
+            OUTPUT_SCHEMA_V2
+        } else {
+            OUTPUT_SCHEMA_V1
+        },
         sampled_at_utc: observer.recorded_at_utc,
         observer_path: arguments.observer.display().to_string(),
         observer_sha256: arguments.observer_sha256,
@@ -625,9 +816,11 @@ mod tests {
             epochs: vec![216, 217, 218, 219],
             elapsed_execution_millis: 336_638_000,
             terminal_slot: 94_175_999,
-            current_completion_overhead_seconds: 10_230,
-            second_epoch_commit_offset_seconds: 2_442,
-            next_pair_replay_seconds: 347_843,
+            current_completion_overhead_seconds: Some(10_230),
+            second_epoch_commit_offset_seconds: Some(2_442),
+            next_pair_replay_seconds: Some(347_843),
+            downstream_allowance_seconds: None,
+            epoch_additional_replay_slots: BTreeMap::new(),
             formula: (216..=219)
                 .map(|epoch| (epoch.to_string(), "bound".to_string()))
                 .collect(),
@@ -646,7 +839,7 @@ mod tests {
             },
             invocation_binding_stable: true,
         };
-        let (_, estimates) = estimate_range(&model, &replay).unwrap();
+        let (_, estimates) = estimate_range(&model, &replay, MODEL_SCHEMA_V1).unwrap();
         assert!(
             estimates
                 .iter()
@@ -676,9 +869,11 @@ mod tests {
             epochs: vec![220, 221, 222, 223],
             elapsed_execution_millis: 214_176_000,
             terminal_slot: 95_903_999,
-            current_completion_overhead_seconds: 8_779,
-            second_epoch_commit_offset_seconds: 2_442,
-            next_pair_replay_seconds: 334_084,
+            current_completion_overhead_seconds: Some(8_779),
+            second_epoch_commit_offset_seconds: Some(2_442),
+            next_pair_replay_seconds: Some(334_084),
+            downstream_allowance_seconds: None,
+            epoch_additional_replay_slots: BTreeMap::new(),
             formula: (220..=223)
                 .map(|epoch| (epoch.to_string(), "bound".to_string()))
                 .collect(),
@@ -697,7 +892,7 @@ mod tests {
             },
             invocation_binding_stable: true,
         };
-        assert!(estimate_range(&model, &replay).is_err());
+        assert!(estimate_range(&model, &replay, MODEL_SCHEMA_V1).is_err());
     }
 
     #[test]
@@ -712,9 +907,11 @@ mod tests {
             epochs: vec![220, 221, 222, 223],
             elapsed_execution_millis: 214_176_000,
             terminal_slot: 95_903_999,
-            current_completion_overhead_seconds: 8_779,
-            second_epoch_commit_offset_seconds: 2_442,
-            next_pair_replay_seconds: 334_084,
+            current_completion_overhead_seconds: Some(8_779),
+            second_epoch_commit_offset_seconds: Some(2_442),
+            next_pair_replay_seconds: Some(334_084),
+            downstream_allowance_seconds: None,
+            epoch_additional_replay_slots: BTreeMap::new(),
             formula: (220..=223)
                 .map(|epoch| (epoch.to_string(), "bound".to_string()))
                 .collect(),
@@ -733,13 +930,65 @@ mod tests {
             },
             invocation_binding_stable: true,
         };
-        let (_, estimates) = estimate_range(&model, &replay).unwrap();
+        let (_, estimates) = estimate_range(&model, &replay, MODEL_SCHEMA_V1).unwrap();
         assert_eq!(
             estimates
                 .iter()
                 .map(|item| item.estimated_remaining_millis)
                 .collect::<Vec<_>>(),
             vec![132_452_000, 134_894_000, 466_536_000, 468_978_000]
+        );
+    }
+
+    #[test]
+    fn derives_variable_length_v2_range_from_bound_slot_offsets() {
+        let controller = "2".repeat(32);
+        let producer = "3".repeat(32);
+        let model = RangeModel {
+            range: "136-138".to_string(),
+            expected_controller_invocation_id: controller.clone(),
+            expected_producer_invocation_id: producer.clone(),
+            archive_directory: "/tmp/lane-output".into(),
+            epochs: vec![136, 137, 138],
+            elapsed_execution_millis: 1_000,
+            terminal_slot: 2_000,
+            current_completion_overhead_seconds: None,
+            second_epoch_commit_offset_seconds: None,
+            next_pair_replay_seconds: None,
+            downstream_allowance_seconds: Some(100),
+            epoch_additional_replay_slots: [
+                ("136".to_string(), 0),
+                ("137".to_string(), 432_000),
+                ("138".to_string(), 864_000),
+            ]
+            .into_iter()
+            .collect(),
+            formula: (136..=138)
+                .map(|epoch| (epoch.to_string(), "bound".to_string()))
+                .collect(),
+        };
+        let replay = Replay {
+            range: model.range.clone(),
+            controller_after: unit(&controller),
+            producer_after: unit(&producer),
+            useful_work: UsefulWork {
+                last: Some(ProgressPoint {
+                    slot: 1_800,
+                    terminal_slot: 2_000,
+                }),
+                slots_per_second: Some(2.0),
+                sufficient_for_rates: true,
+            },
+            invocation_binding_stable: true,
+        };
+        let (range, estimates) = estimate_range(&model, &replay, MODEL_SCHEMA_V2).unwrap();
+        assert_eq!(range.current_completion_seconds, 200);
+        assert_eq!(
+            estimates
+                .iter()
+                .map(|estimate| estimate.estimated_remaining_millis)
+                .collect::<Vec<_>>(),
+            vec![200_000, 216_200_000, 432_200_000]
         );
     }
 
@@ -756,9 +1005,11 @@ mod tests {
                     epochs: vec![216, 217, 218, 219],
                     elapsed_execution_millis: 334_838_000,
                     terminal_slot: 94_175_999,
-                    current_completion_overhead_seconds: 10_230,
-                    second_epoch_commit_offset_seconds: 2_442,
-                    next_pair_replay_seconds: 347_843,
+                    current_completion_overhead_seconds: Some(10_230),
+                    second_epoch_commit_offset_seconds: Some(2_442),
+                    next_pair_replay_seconds: Some(347_843),
+                    downstream_allowance_seconds: None,
+                    epoch_additional_replay_slots: BTreeMap::new(),
                     formula: (216..=219)
                         .map(|epoch| (epoch.to_string(), "bound".to_string()))
                         .collect(),
@@ -777,9 +1028,11 @@ mod tests {
                     epochs: vec![220, 221, 222, 223],
                     elapsed_execution_millis: 212_376_000,
                     terminal_slot: 95_903_999,
-                    current_completion_overhead_seconds: 8_779,
-                    second_epoch_commit_offset_seconds: 2_442,
-                    next_pair_replay_seconds: 334_084,
+                    current_completion_overhead_seconds: Some(8_779),
+                    second_epoch_commit_offset_seconds: Some(2_442),
+                    next_pair_replay_seconds: Some(334_084),
+                    downstream_allowance_seconds: None,
+                    epoch_additional_replay_slots: BTreeMap::new(),
                     formula: (220..=223)
                         .map(|epoch| (epoch.to_string(), "bound".to_string()))
                         .collect(),
@@ -804,7 +1057,7 @@ mod tests {
                 },
                 invocation_binding_stable: true,
             };
-            let (_, estimates) = estimate_range(&model, &replay).unwrap();
+            let (_, estimates) = estimate_range(&model, &replay, MODEL_SCHEMA_V1).unwrap();
             for (actual, expected) in estimates
                 .iter()
                 .map(|item| item.estimated_remaining_millis)
