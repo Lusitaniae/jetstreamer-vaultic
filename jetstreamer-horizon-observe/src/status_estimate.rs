@@ -16,9 +16,11 @@ use {
 
 const MODEL_SCHEMA_V1: &str = "jetstreamer-horizon-r2-status-eta-model-v1";
 const MODEL_SCHEMA_V2: &str = "jetstreamer-horizon-r2-status-eta-model-v2";
+const MODEL_SCHEMA_V3: &str = "jetstreamer-horizon-r2-status-eta-model-v3";
 const OBSERVER_SCHEMA: &str = "jetstreamer-horizon-live-resource-sample-v2";
 const OUTPUT_SCHEMA_V1: &str = "jetstreamer-horizon-r2-status-estimates-v1";
 const OUTPUT_SCHEMA_V2: &str = "jetstreamer-horizon-r2-status-estimates-v2";
+const OUTPUT_SCHEMA_V3: &str = "jetstreamer-horizon-r2-status-estimates-v3";
 const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -304,7 +306,10 @@ fn read_exact(path: &Path, expected_sha256: &str, immutable_root_owned: bool) ->
 
 fn validate_model(model: &Model) -> Result<()> {
     ensure!(
-        matches!(model.schema.as_str(), MODEL_SCHEMA_V1 | MODEL_SCHEMA_V2),
+        matches!(
+            model.schema.as_str(),
+            MODEL_SCHEMA_V1 | MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3
+        ),
         "model schema mismatch"
     );
     ensure!(model.phase == "replay", "model phase mismatch");
@@ -335,7 +340,7 @@ fn validate_model(model: &Model) -> Result<()> {
             .validation
             .reproduces_2026_10_17_t04_47_00_z_statuses_exactly;
     ensure!(
-        if model.schema == MODEL_SCHEMA_V2 {
+        if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3) {
             model.validation.prior_status_receipts_reproduced
         } else {
             legacy_validation
@@ -352,7 +357,7 @@ fn validate_model(model: &Model) -> Result<()> {
         "model authority is unsafe"
     );
     ensure!(!model.ranges.is_empty(), "model has no public ranges");
-    if model.schema == MODEL_SCHEMA_V2 {
+    if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3) {
         let estimate_directory = model
             .estimate_receipt_directory
             .as_ref()
@@ -466,7 +471,7 @@ fn validate_model(model: &Model) -> Result<()> {
             "model does not cover exactly epochs 216-223"
         );
     }
-    if model.schema == MODEL_SCHEMA_V2 {
+    if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3) {
         let expected: BTreeSet<_> = model
             .expected_observer_ranges
             .iter()
@@ -697,7 +702,8 @@ fn run() -> Result<()> {
         "status receipt directory path is not exact"
     );
     let receipt_directory_metadata = fs::symlink_metadata(&model.status_receipt_directory)?;
-    let expected_receipt_uid = if model.schema == MODEL_SCHEMA_V2 {
+    let expected_receipt_uid = if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3)
+    {
         model
             .status_receipt_directory_uid
             .context("missing status receipt directory owner")?
@@ -722,7 +728,7 @@ fn run() -> Result<()> {
         observer.recorded_at_utc == model.sample_target_utc,
         "observer timestamp mismatch"
     );
-    if model.schema == MODEL_SCHEMA_V2 {
+    if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3) {
         let expected: BTreeSet<_> = model.expected_observer_ranges.iter().collect();
         let observed: BTreeSet<_> = observer
             .replays
@@ -766,10 +772,10 @@ fn run() -> Result<()> {
     }
     estimates.sort_by_key(|item| item.epoch);
     let output = Output {
-        schema: if model.schema == MODEL_SCHEMA_V2 {
-            OUTPUT_SCHEMA_V2
-        } else {
-            OUTPUT_SCHEMA_V1
+        schema: match model.schema.as_str() {
+            MODEL_SCHEMA_V2 => OUTPUT_SCHEMA_V2,
+            MODEL_SCHEMA_V3 => OUTPUT_SCHEMA_V3,
+            _ => OUTPUT_SCHEMA_V1,
         },
         sampled_at_utc: observer.recorded_at_utc,
         observer_path: arguments.observer.display().to_string(),
@@ -1079,6 +1085,108 @@ mod tests {
                 assert!(actual.abs_diff(expected) <= 1_000);
             }
         }
+    }
+
+    #[test]
+    fn v3_accepts_one_healthy_legacy_range_with_complete_observer_census() {
+        let model = Model {
+            schema: MODEL_SCHEMA_V3.to_owned(),
+            sample_target_utc: "2026-10-17T08:17:00Z".to_owned(),
+            phase: "replay".to_owned(),
+            status_receipt_directory: "/tmp/status-receipts".into(),
+            status_receipt_directory_uid: Some(0),
+            estimate_receipt_directory: Some("/tmp/estimate-receipts".into()),
+            expected_observer_ranges: vec![
+                "216-219".to_owned(),
+                "220-223".to_owned(),
+                "206-206".to_owned(),
+            ],
+            evidence: vec![Evidence {
+                path: "/tmp/previous-observer.json".into(),
+                sha256: "a".repeat(64),
+            }],
+            rounding:
+                "round each estimated total to the nearest whole second, then multiply by 1000"
+                    .to_owned(),
+            ranges: vec![RangeModel {
+                range: "220-223".to_owned(),
+                expected_controller_invocation_id: "b".repeat(32),
+                expected_producer_invocation_id: "c".repeat(32),
+                archive_directory: "/tmp/lane-output".into(),
+                epochs: vec![220, 221, 222, 223],
+                elapsed_execution_millis: 1,
+                terminal_slot: 95_903_999,
+                current_completion_overhead_seconds: Some(8_779),
+                second_epoch_commit_offset_seconds: Some(2_442),
+                next_pair_replay_seconds: Some(334_084),
+                downstream_allowance_seconds: None,
+                epoch_additional_replay_slots: BTreeMap::new(),
+                formula: (220..=223)
+                    .map(|epoch| (epoch.to_string(), "bound".to_owned()))
+                    .collect(),
+            }],
+            validation: Validation {
+                prior_status_receipts_reproduced: true,
+                matches_2026_10_17_t04_17_00_z_statuses_within_one_second: false,
+                reproduces_2026_10_17_t04_47_00_z_statuses_exactly: false,
+            },
+            authority: Authority {
+                publication_authorized_only_after_bound_v2_observer_receipt: true,
+                replay_launch_authorized: false,
+                archive_publication_authorized: false,
+                r2_archive_mutations_authorized: false,
+            },
+        };
+        validate_model(&model).unwrap();
+    }
+
+    #[test]
+    fn v3_rejects_modeled_range_absent_from_observer_census() {
+        let model = Model {
+            schema: MODEL_SCHEMA_V3.to_owned(),
+            sample_target_utc: "2026-10-17T08:17:00Z".to_owned(),
+            phase: "replay".to_owned(),
+            status_receipt_directory: "/tmp/status-receipts".into(),
+            status_receipt_directory_uid: Some(0),
+            estimate_receipt_directory: Some("/tmp/estimate-receipts".into()),
+            expected_observer_ranges: vec!["216-219".to_owned(), "206-206".to_owned()],
+            evidence: vec![Evidence {
+                path: "/tmp/previous-observer.json".into(),
+                sha256: "a".repeat(64),
+            }],
+            rounding:
+                "round each estimated total to the nearest whole second, then multiply by 1000"
+                    .to_owned(),
+            ranges: vec![RangeModel {
+                range: "220-223".to_owned(),
+                expected_controller_invocation_id: "b".repeat(32),
+                expected_producer_invocation_id: "c".repeat(32),
+                archive_directory: "/tmp/lane-output".into(),
+                epochs: vec![220, 221, 222, 223],
+                elapsed_execution_millis: 1,
+                terminal_slot: 95_903_999,
+                current_completion_overhead_seconds: Some(8_779),
+                second_epoch_commit_offset_seconds: Some(2_442),
+                next_pair_replay_seconds: Some(334_084),
+                downstream_allowance_seconds: None,
+                epoch_additional_replay_slots: BTreeMap::new(),
+                formula: (220..=223)
+                    .map(|epoch| (epoch.to_string(), "bound".to_owned()))
+                    .collect(),
+            }],
+            validation: Validation {
+                prior_status_receipts_reproduced: true,
+                matches_2026_10_17_t04_17_00_z_statuses_within_one_second: false,
+                reproduces_2026_10_17_t04_47_00_z_statuses_exactly: false,
+            },
+            authority: Authority {
+                publication_authorized_only_after_bound_v2_observer_receipt: true,
+                replay_launch_authorized: false,
+                archive_publication_authorized: false,
+                r2_archive_mutations_authorized: false,
+            },
+        };
+        assert!(validate_model(&model).is_err());
     }
 
     #[test]
