@@ -38,6 +38,10 @@ const MAX_AGE_CORRECTION_EPOCH: u64 = 14;
 const MIN_SUPPORTED_SNAPSHOT_SLOT: u64 = 93_311_535;
 const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
 const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 100_656_000;
+// The build-bound epoch-224 singleton diagnostic needs only the first failing
+// vote in slot 96,767,526.  Refuse the following slot before accepting any of
+// its entries so this diagnostic can never turn into an unbounded epoch replay.
+const DIAGNOSTIC_MAX_ENTRY_SLOT_EXCLUSIVE: u64 = 96_767_527;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const WAVE_METRICS_ENV: &str = "JETSTREAMER_HISTORICAL_WAVE_METRICS";
 const DIAGNOSTIC_SINGLETON_ENV: &str = "JETSTREAMER_HISTORICAL_DIAGNOSTIC_SINGLETON";
@@ -670,6 +674,18 @@ impl RuntimeState {
             ));
         }
         let mut writes = self.freeze_root_and_drain()?;
+        if self.diagnostic_singleton_execution {
+            eprintln!(
+                "historical diagnostic boundary: parent_slot={} next_slot={} parent_bank_hash={} capitalization={} transaction_count={} next_write_version={} freeze_writes={}",
+                self.bank.slot(),
+                slot,
+                self.bank.hash(),
+                self.bank.capitalization(),
+                self.bank.transaction_count(),
+                self.write_cursor,
+                writes.len(),
+            );
+        }
         let child_poh_start = self.bank.last_blockhash();
         let leader = leader_schedule::slot_leader(&self.bank, slot, &mut self.leader_schedules)?;
         let child = Bank::new_from_parent(&self.bank, &leader, slot);
@@ -805,13 +821,22 @@ fn validate_candidate_snapshot_slot(slot: u64) -> Result<(), String> {
 }
 
 fn validate_candidate_entry_slot(slot: u64) -> Result<(), String> {
-    if slot < MIN_SUPPORTED_ENTRY_SLOT || slot >= MAX_SUPPORTED_SLOT_EXCLUSIVE {
+    let max_supported_slot_exclusive = effective_max_supported_entry_slot_exclusive();
+    if slot < MIN_SUPPORTED_ENTRY_SLOT || slot >= max_supported_slot_exclusive {
         return Err(format!(
             "Solana v1.6.20 candidate entry slot {} is outside {}..{}",
-            slot, MIN_SUPPORTED_ENTRY_SLOT, MAX_SUPPORTED_SLOT_EXCLUSIVE
+            slot, MIN_SUPPORTED_ENTRY_SLOT, max_supported_slot_exclusive
         ));
     }
     Ok(())
+}
+
+fn effective_max_supported_entry_slot_exclusive() -> u64 {
+    if cfg!(feature = "diagnostic-singleton") {
+        DIAGNOSTIC_MAX_ENTRY_SLOT_EXCLUSIVE
+    } else {
+        MAX_SUPPORTED_SLOT_EXCLUSIVE
+    }
 }
 
 fn build_poh_pool() -> Result<ThreadPool, String> {
@@ -1467,10 +1492,19 @@ mod tests {
         assert!(validate_candidate_snapshot_slot(MIN_SUPPORTED_SNAPSHOT_SLOT - 1).is_err());
         assert!(validate_candidate_snapshot_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).is_err());
 
+        let entry_end = effective_max_supported_entry_slot_exclusive();
         assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT).is_ok());
-        assert!(validate_candidate_entry_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE - 1).is_ok());
+        assert!(validate_candidate_entry_slot(entry_end - 1).is_ok());
         assert!(validate_candidate_entry_slot(MIN_SUPPORTED_ENTRY_SLOT - 1).is_err());
-        assert!(validate_candidate_entry_slot(MAX_SUPPORTED_SLOT_EXCLUSIVE).is_err());
+        assert!(validate_candidate_entry_slot(entry_end).is_err());
+        assert_eq!(
+            entry_end,
+            if cfg!(feature = "diagnostic-singleton") {
+                DIAGNOSTIC_MAX_ENTRY_SLOT_EXCLUSIVE
+            } else {
+                MAX_SUPPORTED_SLOT_EXCLUSIVE
+            }
+        );
     }
 
     fn request_for(
