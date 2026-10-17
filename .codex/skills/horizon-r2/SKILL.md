@@ -120,7 +120,13 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
 
   This status command intentionally needs no public-origin environment setting. A failed observer
   binding publishes nothing. Do not substitute a hand-written `put-object` command when publication
-  or authenticated readback fails.
+  or authenticated readback fails. Run it with the identity that can traverse and write the configured
+  private receipt directory; validate that access before the first remote mutation. The reviewed
+  publisher treats an existing byte-for-byte identical status payload with the same sample timestamp
+  as an idempotent receipt-recovery retry: it performs no `PutObject`, repeats authenticated readback,
+  and durably writes the missing receipt. It must continue to reject the same timestamp with different
+  content, an older sample, or a different epoch. Use this recovery only after a prior invocation
+  reached remote publication/readback but failed while writing its local receipt.
 - Delete only that epoch's `epoch-N.epoch-status.json`, and only after the canonical `.jet` has been
   uploaded and read back, its `.sha256` sidecar has been created, and the complete pair has durable
   authenticated verification evidence. Status deletion does not wait for an anonymous public

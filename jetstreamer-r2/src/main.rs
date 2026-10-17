@@ -1260,18 +1260,34 @@ fn status_receipt_path(directory: &Path, status: &EpochStatus) -> PathBuf {
     directory.join(format!("epoch-{}.status-{timestamp}.json", status.epoch))
 }
 
-fn validate_status_replacement(previous: &EpochStatus, proposed: &EpochStatus) -> Result<()> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusPublicationAction {
+    Replace,
+    RecoverReceipt,
+}
+
+fn status_publication_action(
+    previous: &EpochStatus,
+    proposed: &EpochStatus,
+) -> Result<StatusPublicationAction> {
     validate_epoch_status(previous, proposed.epoch)?;
     validate_epoch_status(proposed, proposed.epoch)?;
     ensure!(
         previous.epoch == proposed.epoch,
         "existing status object names a different epoch"
     );
+    if previous.sampled_at_utc == proposed.sampled_at_utc {
+        ensure!(
+            previous == proposed,
+            "existing status sample has the proposed timestamp but different content"
+        );
+        return Ok(StatusPublicationAction::RecoverReceipt);
+    }
     ensure!(
         previous.sampled_at_utc < proposed.sampled_at_utc,
         "existing status sample is not older than the proposed sample"
     );
-    Ok(())
+    Ok(StatusPublicationAction::Replace)
 }
 
 fn validate_epoch_status(status: &EpochStatus, expected_epoch: u64) -> Result<()> {
@@ -1377,29 +1393,33 @@ async fn status_publish(
     );
     let key = format!("epoch-{epoch}.epoch-status.json");
     let previous = get_mutable_object(s3, &r2.bucket, &key).await?;
-    if let Some(previous) = &previous {
+    let action = if let Some(previous) = &previous {
         let previous_status: EpochStatus =
             serde_json::from_slice(&previous.bytes).context("existing status JSON is invalid")?;
-        validate_status_replacement(&previous_status, &status)?;
-    }
-    let content_md5 = BASE64_STANDARD.encode(Md5::digest(&status_bytes));
-    let request = s3
-        .put_object()
-        .bucket(&r2.bucket)
-        .key(&key)
-        .content_type("application/json; charset=utf-8")
-        .cache_control("no-store")
-        .content_md5(content_md5)
-        .body(ByteStream::from(status_bytes.clone()));
-    let request = if let Some(previous) = &previous {
-        request.if_match(format!("\"{}\"", previous.etag))
+        status_publication_action(&previous_status, &status)?
     } else {
-        request.if_none_match("*")
+        StatusPublicationAction::Replace
     };
-    request
-        .send()
-        .await
-        .map_err(|error| anyhow!("conditional status publication failed: {error:?}"))?;
+    if action == StatusPublicationAction::Replace {
+        let content_md5 = BASE64_STANDARD.encode(Md5::digest(&status_bytes));
+        let request = s3
+            .put_object()
+            .bucket(&r2.bucket)
+            .key(&key)
+            .content_type("application/json; charset=utf-8")
+            .cache_control("no-store")
+            .content_md5(content_md5)
+            .body(ByteStream::from(status_bytes.clone()));
+        let request = if let Some(previous) = &previous {
+            request.if_match(format!("\"{}\"", previous.etag))
+        } else {
+            request.if_none_match("*")
+        };
+        request
+            .send()
+            .await
+            .map_err(|error| anyhow!("conditional status publication failed: {error:?}"))?;
+    }
     let authenticated = get_mutable_object(s3, &r2.bucket, &key)
         .await?
         .ok_or_else(|| anyhow!("status object disappeared after publication"))?;
@@ -2792,11 +2812,20 @@ mod tests {
         );
         let mut older = status.clone();
         older.sampled_at_utc = "2026-10-17T00:40:00Z".to_owned();
-        validate_status_replacement(&older, &status).unwrap();
-        assert!(validate_status_replacement(&status, &older).is_err());
-        assert!(validate_status_replacement(&status, &status).is_err());
+        assert_eq!(
+            status_publication_action(&older, &status).unwrap(),
+            StatusPublicationAction::Replace
+        );
+        assert!(status_publication_action(&status, &older).is_err());
+        assert_eq!(
+            status_publication_action(&status, &status).unwrap(),
+            StatusPublicationAction::RecoverReceipt
+        );
+        let mut conflicting = status.clone();
+        conflicting.jet_size_bytes = 1;
+        assert!(status_publication_action(&status, &conflicting).is_err());
         older.epoch = 219;
-        assert!(validate_status_replacement(&older, &status).is_err());
+        assert!(status_publication_action(&older, &status).is_err());
     }
 
     fn public_receipt(epoch: u64) -> PublicReceipt {
