@@ -52,6 +52,7 @@ struct RangeModel {
     expected_controller_invocation_id: String,
     expected_producer_invocation_id: String,
     epochs: Vec<u64>,
+    elapsed_execution_millis: u64,
     terminal_slot: u64,
     current_completion_overhead_seconds: u64,
     second_epoch_commit_offset_seconds: u64,
@@ -138,6 +139,7 @@ struct RangeOutput {
 #[derive(Debug, Serialize)]
 struct EpochEstimate {
     epoch: u64,
+    elapsed_execution_millis: u64,
     estimated_remaining_millis: u64,
 }
 
@@ -418,6 +420,7 @@ fn estimate_range(
         .map(|(epoch, seconds)| {
             Ok(EpochEstimate {
                 epoch: *epoch,
+                elapsed_execution_millis: model.elapsed_execution_millis,
                 estimated_remaining_millis: seconds
                     .checked_mul(1000)
                     .context("millisecond overflow")?,
@@ -578,6 +581,7 @@ mod tests {
             expected_controller_invocation_id: controller.to_string(),
             expected_producer_invocation_id: producer.to_string(),
             epochs: vec![216, 217, 218, 219],
+            elapsed_execution_millis: 336_638_000,
             terminal_slot: 94_175_999,
             current_completion_overhead_seconds: 10_230,
             second_epoch_commit_offset_seconds: 2_442,
@@ -601,6 +605,11 @@ mod tests {
             invocation_binding_stable: true,
         };
         let (_, estimates) = estimate_range(&model, &replay).unwrap();
+        assert!(
+            estimates
+                .iter()
+                .all(|item| item.elapsed_execution_millis == 336_638_000)
+        );
         assert_eq!(
             estimates
                 .iter()
@@ -617,6 +626,7 @@ mod tests {
             expected_controller_invocation_id: "0".repeat(32),
             expected_producer_invocation_id: "1".repeat(32),
             epochs: vec![220, 221, 222, 223],
+            elapsed_execution_millis: 214_176_000,
             terminal_slot: 95_903_999,
             current_completion_overhead_seconds: 8_779,
             second_epoch_commit_offset_seconds: 2_442,
@@ -651,6 +661,7 @@ mod tests {
             expected_controller_invocation_id: controller.to_string(),
             expected_producer_invocation_id: producer.to_string(),
             epochs: vec![220, 221, 222, 223],
+            elapsed_execution_millis: 214_176_000,
             terminal_slot: 95_903_999,
             current_completion_overhead_seconds: 8_779,
             second_epoch_commit_offset_seconds: 2_442,
@@ -693,6 +704,7 @@ mod tests {
                         .to_string(),
                     expected_producer_invocation_id: "95fb05d1b78349bcb907c1e930e7682e".to_string(),
                     epochs: vec![216, 217, 218, 219],
+                    elapsed_execution_millis: 334_838_000,
                     terminal_slot: 94_175_999,
                     current_completion_overhead_seconds: 10_230,
                     second_epoch_commit_offset_seconds: 2_442,
@@ -712,6 +724,7 @@ mod tests {
                         .to_string(),
                     expected_producer_invocation_id: "c2adebaad0cb42b385156631156813fe".to_string(),
                     epochs: vec![220, 221, 222, 223],
+                    elapsed_execution_millis: 212_376_000,
                     terminal_slot: 95_903_999,
                     current_completion_overhead_seconds: 8_779,
                     second_epoch_commit_offset_seconds: 2_442,
