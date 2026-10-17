@@ -38,6 +38,8 @@ struct Model {
     phase: String,
     status_receipt_directory: PathBuf,
     #[serde(default)]
+    status_receipt_directory_uid: Option<u32>,
+    #[serde(default)]
     estimate_receipt_directory: Option<PathBuf>,
     #[serde(default)]
     expected_observer_ranges: Vec<String>,
@@ -358,6 +360,10 @@ fn validate_model(model: &Model) -> Result<()> {
         ensure!(
             estimate_directory.is_absolute(),
             "estimate receipt directory is not absolute"
+        );
+        ensure!(
+            model.status_receipt_directory_uid.is_some(),
+            "v2 model lacks status receipt directory owner"
         );
         ensure!(
             !model.expected_observer_ranges.is_empty(),
@@ -691,9 +697,16 @@ fn run() -> Result<()> {
         "status receipt directory path is not exact"
     );
     let receipt_directory_metadata = fs::symlink_metadata(&model.status_receipt_directory)?;
+    let expected_receipt_uid = if model.schema == MODEL_SCHEMA_V2 {
+        model
+            .status_receipt_directory_uid
+            .context("missing status receipt directory owner")?
+    } else {
+        0
+    };
     ensure!(
         receipt_directory_metadata.is_dir()
-            && receipt_directory_metadata.uid() == 0
+            && receipt_directory_metadata.uid() == expected_receipt_uid
             && receipt_directory_metadata.mode() & 0o7777 == 0o700,
         "status receipt directory identity or mode mismatch"
     );
