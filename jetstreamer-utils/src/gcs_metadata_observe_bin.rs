@@ -21,6 +21,8 @@ use {
 const PLAN_SCHEMA: &str = "jetstreamer-gcs-metadata-observation-plan-v1";
 const RECEIPT_SCHEMA: &str = "jetstreamer-private-configured-gcs-metadata-reobservation-v1";
 const CAPABILITY_SCHEMA: &str = "jetstreamer-private-configured-complete-span-capability-v1";
+const LEGACY_EPOCH203_CAPABILITY_SCHEMA: &str =
+    "jetstreamer-private-focused-tail-node-capability-v2";
 const RESTORE_SCHEMA: &str = "jetstreamer-bound-gcs-snapshot-restore-v1";
 const MAX_PLAN_BYTES: u64 = 1024 * 1024;
 const MAX_EVIDENCE_BYTES: u64 = 16 * 1024 * 1024;
@@ -353,6 +355,61 @@ fn validate_plan(plan: &Plan) -> Result<()> {
 }
 
 fn validate_capability(value: &Value, epoch: u64) -> Result<()> {
+    if epoch == 203
+        && value.get("schema").and_then(Value::as_str) == Some(LEGACY_EPOCH203_CAPABILITY_SCHEMA)
+    {
+        ensure!(
+            value.pointer("/probe/epoch").and_then(Value::as_u64) == Some(203),
+            "legacy epoch-203 capability epoch mismatch"
+        );
+        ensure!(
+            value
+                .pointer("/probe/bootstrap_slot")
+                .and_then(Value::as_u64)
+                == Some(87_695_515)
+                && value
+                    .pointer("/probe/output_slot_start")
+                    .and_then(Value::as_u64)
+                    == Some(87_696_000)
+                && value
+                    .pointer("/probe/terminal_slot")
+                    .and_then(Value::as_u64)
+                    == Some(88_559_361),
+            "legacy epoch-203 capability range mismatch"
+        );
+        ensure!(
+            value
+                .pointer("/attestation/exact_node_tail_planner_capability_passed")
+                .and_then(Value::as_bool)
+                == Some(true)
+                && value
+                    .pointer("/attestation/full_replay_authorized")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && value
+                    .pointer("/attestation/fresh_epoch203_specific_resource_admission_passed")
+                    .and_then(Value::as_bool)
+                    == Some(false),
+            "legacy epoch-203 capability attestation mismatch"
+        );
+        ensure!(
+            value
+                .pointer("/probe/worker_spawned")
+                .and_then(Value::as_bool)
+                == Some(false)
+                && value
+                    .pointer("/probe/archive_created")
+                    .and_then(Value::as_bool)
+                    == Some(false)
+                && value
+                    .pointer("/probe/canonical_sidecar_created")
+                    .and_then(Value::as_bool)
+                    == Some(false),
+            "legacy epoch-203 capability unexpectedly reached replay"
+        );
+        return Ok(());
+    }
+
     ensure!(value.get("schema").and_then(Value::as_str) == Some(CAPABILITY_SCHEMA));
     ensure!(value.get("epoch").and_then(Value::as_u64) == Some(epoch));
     ensure!(
@@ -764,6 +821,31 @@ mod tests {
         validate_capability(&value, 211).unwrap();
         value["assessment"]["full_replay_authorized"] = Value::Bool(true);
         assert!(validate_capability(&value, 211).is_err());
+    }
+
+    #[test]
+    fn accepts_only_the_exact_legacy_epoch203_capability() {
+        let mut value = json!({
+            "schema": LEGACY_EPOCH203_CAPABILITY_SCHEMA,
+            "probe": {
+                "epoch": 203,
+                "bootstrap_slot": 87_695_515_u64,
+                "output_slot_start": 87_696_000_u64,
+                "terminal_slot": 88_559_361_u64,
+                "worker_spawned": false,
+                "archive_created": false,
+                "canonical_sidecar_created": false
+            },
+            "attestation": {
+                "exact_node_tail_planner_capability_passed": true,
+                "full_replay_authorized": false,
+                "fresh_epoch203_specific_resource_admission_passed": false
+            }
+        });
+        validate_capability(&value, 203).unwrap();
+        assert!(validate_capability(&value, 204).is_err());
+        value["probe"]["terminal_slot"] = Value::from(88_559_360_u64);
+        assert!(validate_capability(&value, 203).is_err());
     }
 
     #[test]
