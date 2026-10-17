@@ -40,6 +40,7 @@ const MIN_SUPPORTED_ENTRY_SLOT: u64 = MIN_SUPPORTED_SNAPSHOT_SLOT + 1;
 const MAX_SUPPORTED_SLOT_EXCLUSIVE: u64 = 100_656_000;
 const POH_THREADS_ENV: &str = "JETSTREAMER_HISTORICAL_POH_THREADS";
 const WAVE_METRICS_ENV: &str = "JETSTREAMER_HISTORICAL_WAVE_METRICS";
+const DIAGNOSTIC_SINGLETON_ENV: &str = "JETSTREAMER_HISTORICAL_DIAGNOSTIC_SINGLETON";
 const WAVE_METRICS_REPORT_INTERVAL_TRANSACTIONS: u64 = 1_000_000;
 const ABSOLUTE_MAX_POH_THREADS: usize = 256;
 // The validator runs AccountsBackgroundService alongside replay. This worker
@@ -64,6 +65,7 @@ pub struct RuntimeState {
     last_accounts_clean_block_height: u64,
     accounts_shrink_consumed_budget: usize,
     execution_wave_metrics: ExecutionWaveMetrics,
+    diagnostic_singleton_execution: bool,
 }
 
 #[derive(Default)]
@@ -145,6 +147,18 @@ impl RuntimeState {
         initial_state: &jetstreamer_historical_protocol::InitialState,
         scratch_root: Option<&str>,
     ) -> Result<(Self, Initialized), String> {
+        let diagnostic_singleton_execution = configured_diagnostic_singleton_execution()?;
+        if diagnostic_singleton_execution {
+            if env::var_os("JETSTREAMER_HISTORICAL_TRACE").is_none() {
+                return Err(format!(
+                    "{}=1 requires JETSTREAMER_HISTORICAL_TRACE for a diagnostic-only run",
+                    DIAGNOSTIC_SINGLETON_ENV
+                ));
+            }
+            eprintln!(
+                "historical diagnostic: forcing one transaction per execution wave; output is diagnostic-only"
+            );
+        }
         let state_dir = snapshot::private_state_dir(scratch_root)?;
         let genesis = snapshot::load_genesis(Path::new(ledger_path), &state_dir)?;
         let genesis_hash = genesis.hash().to_string();
@@ -215,6 +229,7 @@ impl RuntimeState {
                 execution_wave_metrics: ExecutionWaveMetrics::new(
                     env::var_os(WAVE_METRICS_ENV).is_some(),
                 ),
+                diagnostic_singleton_execution,
             },
             initialized,
         ))
@@ -321,7 +336,11 @@ impl RuntimeState {
             // Writable keys are unique inside a wave, so drained writes retain
             // exact signature attribution without forcing every transaction
             // through a separate AccountsDb store call.
-            let execution_waves = transaction_waves(&self.bank, &transactions);
+            let execution_waves = selected_transaction_waves(
+                &self.bank,
+                &transactions,
+                self.diagnostic_singleton_execution,
+            );
             for wave in &execution_waves {
                 let wave_transactions = &transactions[wave.clone()];
                 let signatures_by_writable_key = writable_key_attribution(
@@ -769,6 +788,7 @@ impl RuntimeState {
             last_accounts_clean_block_height: 0,
             accounts_shrink_consumed_budget: 0,
             execution_wave_metrics: ExecutionWaveMetrics::new(false),
+            diagnostic_singleton_execution: false,
         }
     }
 }
@@ -1089,6 +1109,46 @@ fn processing_max_age(stable_cluster: bool, epoch: u64) -> usize {
     }
 }
 
+fn parse_diagnostic_singleton_execution(value: Option<&str>) -> Result<bool, String> {
+    match value {
+        None => Ok(false),
+        Some("1") => Ok(true),
+        Some(other) => Err(format!(
+            "{} must be exactly 1 when set, got {:?}",
+            DIAGNOSTIC_SINGLETON_ENV, other
+        )),
+    }
+}
+
+fn configured_diagnostic_singleton_execution() -> Result<bool, String> {
+    match env::var(DIAGNOSTIC_SINGLETON_ENV) {
+        Ok(value) => parse_diagnostic_singleton_execution(Some(&value)),
+        Err(env::VarError::NotPresent) => parse_diagnostic_singleton_execution(None),
+        Err(env::VarError::NotUnicode(_)) => Err(format!(
+            "{} contains non-Unicode data",
+            DIAGNOSTIC_SINGLETON_ENV
+        )),
+    }
+}
+
+fn singleton_transaction_waves(transaction_count: usize) -> Vec<Range<usize>> {
+    (0..transaction_count)
+        .map(|index| index..index + 1)
+        .collect()
+}
+
+fn selected_transaction_waves(
+    bank: &Bank,
+    transactions: &[Transaction],
+    diagnostic_singleton_execution: bool,
+) -> Vec<Range<usize>> {
+    if diagnostic_singleton_execution {
+        singleton_transaction_waves(transactions.len())
+    } else {
+        transaction_waves(bank, transactions)
+    }
+}
+
 /// Partition transactions into the largest consecutive prefixes accepted by
 /// the Bank's own account-lock implementation. Probing acquires no lasting
 /// locks and mutates no Bank state; dropping each batch before execution makes
@@ -1336,6 +1396,54 @@ mod tests {
         assert_eq!(metrics.singleton_waves, 1);
         assert_eq!(metrics.maximum_wave_size, 8);
         assert_eq!(metrics.size_histogram, [1, 1, 1, 1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn diagnostic_singleton_override_is_exact_and_fail_closed() {
+        assert!(!parse_diagnostic_singleton_execution(None).unwrap());
+        assert!(parse_diagnostic_singleton_execution(Some("1")).unwrap());
+        assert!(parse_diagnostic_singleton_execution(Some("0")).is_err());
+        assert!(parse_diagnostic_singleton_execution(Some("true")).is_err());
+        assert!(parse_diagnostic_singleton_execution(Some("")).is_err());
+    }
+
+    #[test]
+    fn diagnostic_singleton_waves_preserve_wire_order() {
+        assert!(singleton_transaction_waves(0).is_empty());
+        assert_eq!(singleton_transaction_waves(1), vec![0..1]);
+        assert_eq!(singleton_transaction_waves(4), vec![0..1, 1..2, 2..3, 3..4]);
+    }
+
+    #[test]
+    fn diagnostic_singleton_flag_cannot_silently_change_ordinary_execution() {
+        let (state, mint_keypair) = test_state(2, Some(4));
+        let first_recipient = Keypair::new();
+        let second_payer = Keypair::new();
+        let second_recipient = Keypair::new();
+        let recent_blockhash = state.bank.last_blockhash();
+        let transactions = vec![
+            system_transaction::transfer(
+                &mint_keypair,
+                &first_recipient.pubkey(),
+                1,
+                recent_blockhash,
+            ),
+            system_transaction::transfer(
+                &second_payer,
+                &second_recipient.pubkey(),
+                1,
+                recent_blockhash,
+            ),
+        ];
+
+        assert_eq!(
+            selected_transaction_waves(&state.bank, &transactions, false),
+            vec![0..2]
+        );
+        assert_eq!(
+            selected_transaction_waves(&state.bank, &transactions, true),
+            vec![0..1, 1..2]
+        );
     }
 
     #[test]
