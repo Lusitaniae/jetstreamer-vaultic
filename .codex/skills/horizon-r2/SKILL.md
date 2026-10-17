@@ -505,12 +505,14 @@ lease: if ranges overlap accidentally, stop the duplicate producer rather than r
   retry inside the cadence window. The sample is resource evidence only: combine it with current
   invocation-bound guard receipts and the complete reserve/admission arithmetic before launching a
   new replay or lowering an external remaining-growth claim.
-  Standardize every newly authored observer deployment on v2 end to end: require config schema
-  `jetstreamer-horizon-live-resource-sample-config-v2` and output schema
-  `jetstreamer-horizon-live-resource-sample-v2`. Do not author, seal, or install a new v1 observer
-  config or receipt. Preserve historical v1 receipts unchanged and allow the last one only as the
-  cadence predecessor for the first v2 sample; a v1 receipt is never valid status-publication,
-  throughput, scaling, or fresh-admission evidence.
+  Use observer schema v2 end to end for every active deployment and all current operational
+  evidence: require config schema `jetstreamer-horizon-live-resource-sample-config-v2` and output
+  schema `jetstreamer-horizon-live-resource-sample-v2`. Author, seal, install, and consume only v2
+  observer configs and receipts for status publication, throughput, scaling, and fresh admission.
+  Preserve immutable pre-v2 historical receipts only as history. The final historical receipt may
+  appear solely as the cadence predecessor named by the first v2 receipt; it is not current
+  operational evidence and must never be copied, rewritten, or promoted into an active config or
+  receipt.
 - For pinned legacy Solana workers, record the visible CPU count and the effective
   `SOLANA_RAYON_THREADS` value. When unset, the old thread-limit crate defaults to half of visible
   CPUs, and AccountsDb also uses that value as its minimum store fan-out; a high-core host can
