@@ -97,6 +97,10 @@ struct Validation {
     #[serde(default)]
     prior_status_receipts_reproduced: bool,
     #[serde(default)]
+    cohort_gate_evidence_validated: bool,
+    #[serde(default)]
+    prior_downstream_allowances_reused: bool,
+    #[serde(default)]
     #[serde(rename = "matches_2026_10_17T04_17_00Z_statuses_within_one_second")]
     matches_2026_10_17_t04_17_00_z_statuses_within_one_second: bool,
     #[serde(default)]
@@ -344,11 +348,11 @@ fn validate_model(model: &Model) -> Result<()> {
             .validation
             .reproduces_2026_10_17_t04_47_00_z_statuses_exactly;
     ensure!(
-        if matches!(
-            model.schema.as_str(),
-            MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3 | MODEL_SCHEMA_V4
-        ) {
+        if matches!(model.schema.as_str(), MODEL_SCHEMA_V2 | MODEL_SCHEMA_V3) {
             model.validation.prior_status_receipts_reproduced
+        } else if model.schema == MODEL_SCHEMA_V4 {
+            model.validation.cohort_gate_evidence_validated
+                && model.validation.prior_downstream_allowances_reused
         } else {
             legacy_validation
         },
@@ -1193,6 +1197,8 @@ mod tests {
             ranges: vec![range],
             validation: Validation {
                 prior_status_receipts_reproduced: true,
+                cohort_gate_evidence_validated: true,
+                prior_downstream_allowances_reused: true,
                 matches_2026_10_17_t04_17_00_z_statuses_within_one_second: false,
                 reproduces_2026_10_17_t04_47_00_z_statuses_exactly: false,
             },
@@ -1329,6 +1335,8 @@ mod tests {
             }],
             validation: Validation {
                 prior_status_receipts_reproduced: true,
+                cohort_gate_evidence_validated: false,
+                prior_downstream_allowances_reused: false,
                 matches_2026_10_17_t04_17_00_z_statuses_within_one_second: false,
                 reproduces_2026_10_17_t04_47_00_z_statuses_exactly: false,
             },
@@ -1379,6 +1387,8 @@ mod tests {
             }],
             validation: Validation {
                 prior_status_receipts_reproduced: true,
+                cohort_gate_evidence_validated: false,
+                prior_downstream_allowances_reused: false,
                 matches_2026_10_17_t04_17_00_z_statuses_within_one_second: false,
                 reproduces_2026_10_17_t04_47_00_z_statuses_exactly: false,
             },
