@@ -127,7 +127,8 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   and durably writes the missing receipt. It must continue to reject the same timestamp with different
   content, an older sample, or a different epoch. Use this recovery only after a prior invocation
   reached remote publication/readback but failed while writing its local receipt.
-- When an active legacy multi-epoch lane has a hash-bound ETA model, derive the definite ETA values
+- When an active legacy multi-epoch lane has a hash-bound ETA model, derive the definite ETA and
+  elapsed-execution millisecond values
   with the reviewed, sealed Rust `jetstreamer-horizon-status-estimate` binary before calling
   `status-publish`. Bind the exact model, observer receipt, and running estimator SHA-256 values.
   The model must name the expected zero-restart controller and producer invocation IDs, its prior
