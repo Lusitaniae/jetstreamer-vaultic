@@ -44,6 +44,10 @@ path = "src/focused_package_attest_bin.rs"
 name = "jetstreamer-gcs-metadata-observe"
 path = "src/gcs_metadata_observe_bin.rs"
 
+[[bin]]
+name = "jetstreamer-horizon-boundary-bridge"
+path = "src/horizon_boundary_bridge_bin.rs"
+
 [dependencies]
 tokio = { workspace = true, features = ["full"] }
 log.workspace = true
