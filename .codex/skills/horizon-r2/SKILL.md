@@ -144,6 +144,24 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   authenticated verification evidence. Status deletion does not wait for an anonymous public
   origin. A missing status object is not archive completion evidence. Never use this exception to
   delete or overwrite any `.jet`, `.sha256`, receipt, or differently named R2 object.
+  Use the reviewed Rust uploader's `status-delete` command with the latest exact status-publication
+  receipt and its SHA-256 plus the canonical archive-receipt directory:
+
+  ```sh
+  target/release/jetstreamer-r2 status-delete "$HORIZON_DIR" \
+    --epochs N-N \
+    --receipt-directory "$HOME/.jetstreamer-private/r2-status-receipts" \
+    --archive-receipt-directory "$HOME/.jetstreamer-private/r2-receipts" \
+    --status-publication-receipt /absolute/epoch-N.status-TIMESTAMP.json \
+    --status-publication-sha256 STATUS_RECEIPT_SHA256
+  ```
+
+  The command must revalidate the durable whole-object archive receipt and authenticated archive/
+  sidecar pair before and after deletion, require the current status bytes and ETag to match the
+  bound publication receipt, issue one conditional delete for only the canonical status key,
+  verify authenticated absence, and fsync a private no-clobber deletion receipt. Its idempotent
+  recovery path may accept an already-absent status only when the exact authenticated publication
+  receipt proves that object previously existed and the ready pair still passes every gate.
 
 ## Resolve the work
 

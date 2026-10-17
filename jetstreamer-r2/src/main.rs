@@ -1,8 +1,10 @@
 //! Upload verified Horizon archives to Cloudflare R2, restore verified copies,
 //! and retire local copies.
 //!
-//! The remote API surface is intentionally append-only: this program contains
-//! no DeleteObject operation. A local archive is removed only after its exact
+//! The archive API surface is intentionally append-only. The sole remote
+//! deletion operation is the fail-closed removal of a mutable
+//! `epoch-N.epoch-status.json` after the canonical archive and sidecar have
+//! durable authenticated completion evidence. A local archive is removed only after its exact
 //! SHA-256 sidecar, length, multipart ETag, and immutable metadata have been
 //! observed in R2 and a private receipt has been fsynced. The sidecar is
 //! published last and serves as the remote completion marker.
@@ -53,6 +55,8 @@ const RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-receipt-v1";
 const PUBLIC_RECEIPT_SCHEMA: &str = "jetstreamer-horizon-r2-public-read-receipt-v1";
 const STATUS_RECEIPT_SCHEMA: &str =
     "jetstreamer-horizon-r2-status-authenticated-publication-receipt-v1";
+const STATUS_DELETION_RECEIPT_SCHEMA: &str =
+    "jetstreamer-horizon-r2-status-authenticated-deletion-receipt-v1";
 
 #[derive(Debug)]
 struct Config {
@@ -75,6 +79,9 @@ struct Config {
     elapsed_execution_millis: Option<u64>,
     estimated_remaining_millis: Option<u64>,
     phase: Option<String>,
+    archive_receipt_directory: Option<PathBuf>,
+    status_publication_receipt: Option<PathBuf>,
+    status_publication_sha256: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -86,6 +93,7 @@ enum Command {
     Verify,
     Restore,
     StatusPublish,
+    StatusDelete,
 }
 
 #[derive(Clone, Debug)]
@@ -190,15 +198,38 @@ struct StatusPublicationReceipt {
     verified_unix_seconds: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct StatusDeletionReceipt {
+    schema: String,
+    bucket: String,
+    epoch: u64,
+    key: String,
+    deleted_object_etag: String,
+    deleted_status: EpochStatus,
+    status_publication_receipt: PathBuf,
+    status_publication_receipt_sha256: String,
+    archive_receipt: PathBuf,
+    archive_receipt_sha256: String,
+    archive_sha256: String,
+    archive_etag: String,
+    conditional_delete_request_sent: bool,
+    authenticated_ready_pair_before: bool,
+    authenticated_status_absent_after: bool,
+    authenticated_ready_pair_after: bool,
+    verified_unix_seconds: u64,
+}
+
 fn usage() -> ! {
     eprintln!(concat!(
-        "usage: horizon-r2 <inventory|public-verify|retire-local|sync|verify|restore|status-publish> DIRECTORY [--epochs START-END] ",
+        "usage: horizon-r2 <inventory|public-verify|retire-local|sync|verify|restore|status-publish|status-delete> DIRECTORY [--epochs START-END] ",
         "[--receipt-directory DIRECTORY] [--public-receipt-directory DIRECTORY] [--delete-local] [--part-size-mib N] ",
         "[--legacy-part-size-mib N] [--legacy-etag-only] [--overwrite-existing] ",
         "[--repair-orphaned-archive] ",
         "[--concurrency N] [--observer-receipt FILE] [--observer-sha256 HEX] ",
         "[--expected-controller-invocation-id ID] [--expected-producer-invocation-id ID] ",
-        "[--elapsed-execution-millis N] [--estimated-remaining-millis N] [--phase PHASE]"
+        "[--elapsed-execution-millis N] [--estimated-remaining-millis N] [--phase PHASE] ",
+        "[--archive-receipt-directory DIRECTORY] [--status-publication-receipt FILE] ",
+        "[--status-publication-sha256 HEX]"
     ));
     std::process::exit(2);
 }
@@ -217,6 +248,7 @@ fn parse_args() -> Result<Config> {
         Some("verify") => Command::Verify,
         Some("restore") => Command::Restore,
         Some("status-publish") => Command::StatusPublish,
+        Some("status-delete") => Command::StatusDelete,
         _ => usage(),
     };
     let directory = args.next().map(PathBuf::from).unwrap_or_else(|| usage());
@@ -237,6 +269,9 @@ fn parse_args() -> Result<Config> {
     let mut elapsed_execution_millis = None;
     let mut estimated_remaining_millis = None;
     let mut phase = None;
+    let mut archive_receipt_directory = None;
+    let mut status_publication_receipt = None;
+    let mut status_publication_sha256 = None;
     while let Some(argument) = args.next() {
         let argument = argument
             .into_string()
@@ -280,6 +315,13 @@ fn parse_args() -> Result<Config> {
                 )
             }
             "--phase" => phase = Some(value()?),
+            "--archive-receipt-directory" => {
+                archive_receipt_directory = Some(PathBuf::from(value()?))
+            }
+            "--status-publication-receipt" => {
+                status_publication_receipt = Some(PathBuf::from(value()?))
+            }
+            "--status-publication-sha256" => status_publication_sha256 = Some(value()?),
             "--concurrency" => {
                 concurrency = value()?.parse().context("invalid --concurrency")?;
                 ensure!(
@@ -324,6 +366,18 @@ fn parse_args() -> Result<Config> {
             "observer receipt path must be absolute"
         );
     }
+    if let Some(archive_receipt_directory) = &archive_receipt_directory {
+        ensure!(
+            archive_receipt_directory.is_absolute(),
+            "archive receipt directory must be absolute"
+        );
+    }
+    if let Some(status_publication_receipt) = &status_publication_receipt {
+        ensure!(
+            status_publication_receipt.is_absolute(),
+            "status publication receipt path must be absolute"
+        );
+    }
     ensure!(
         public_receipt_directory.is_none() || command == Command::PublicVerify,
         "--public-receipt-directory is valid only with public-verify"
@@ -358,6 +412,13 @@ fn parse_args() -> Result<Config> {
     ensure!(
         command == Command::StatusPublish || !status_options_present,
         "status publication options are valid only with status-publish"
+    );
+    let status_delete_options_present = archive_receipt_directory.is_some()
+        || status_publication_receipt.is_some()
+        || status_publication_sha256.is_some();
+    ensure!(
+        command == Command::StatusDelete || !status_delete_options_present,
+        "status deletion options are valid only with status-delete"
     );
     if command == Command::StatusPublish {
         ensure!(observer_receipt.is_some(), "--observer-receipt is required");
@@ -413,19 +474,42 @@ fn parse_args() -> Result<Config> {
             "--phase must be replay, verification, upload, or readback"
         );
     }
+    if command == Command::StatusDelete {
+        ensure!(
+            archive_receipt_directory.is_some(),
+            "--archive-receipt-directory is required"
+        );
+        ensure!(
+            status_publication_receipt.is_some(),
+            "--status-publication-receipt is required"
+        );
+        ensure!(
+            status_publication_sha256.is_some(),
+            "--status-publication-sha256 is required"
+        );
+        ensure!(
+            !delete_local && !overwrite_existing && !repair_orphaned_archive && !legacy_etag_only,
+            "archive mutation/legacy options are invalid with status-delete"
+        );
+        ensure!(
+            is_lower_hex(status_publication_sha256.as_deref().expect("checked"), 64),
+            "--status-publication-sha256 must be 64 lowercase hexadecimal characters"
+        );
+    }
     let epochs = match (command, epochs) {
         (Command::Inventory, None) => bail!("inventory requires --epochs START-END"),
         (Command::PublicVerify, None) => bail!("public-verify requires --epochs START-END"),
         (Command::RetireLocal, None) => bail!("retire-local requires --epochs START-END"),
         (Command::Restore, None) => bail!("restore requires --epochs START-END"),
         (Command::StatusPublish, None) => bail!("status-publish requires --epochs N-N"),
+        (Command::StatusDelete, None) => bail!("status-delete requires --epochs N-N"),
         (_, Some(epochs)) => epochs,
         (_, None) => discover_local_epochs(&directory)?,
     };
     ensure!(!epochs.is_empty(), "no Horizon epochs selected");
     ensure!(
-        command != Command::StatusPublish || epochs.len() == 1,
-        "status-publish requires exactly one epoch"
+        !matches!(command, Command::StatusPublish | Command::StatusDelete) || epochs.len() == 1,
+        "status-publish and status-delete require exactly one epoch"
     );
     Ok(Config {
         command,
@@ -447,6 +531,9 @@ fn parse_args() -> Result<Config> {
         elapsed_execution_millis,
         estimated_remaining_millis,
         phase,
+        archive_receipt_directory,
+        status_publication_receipt,
+        status_publication_sha256,
     })
 }
 
@@ -1266,6 +1353,17 @@ enum StatusPublicationAction {
     RecoverReceipt,
 }
 
+fn validate_status_publication_after_sidecar(
+    action: StatusPublicationAction,
+    sidecar_is_committed: bool,
+) -> Result<()> {
+    ensure!(
+        !sidecar_is_committed || action == StatusPublicationAction::RecoverReceipt,
+        "canonical sidecar is already committed; status replacement is forbidden"
+    );
+    Ok(())
+}
+
 fn status_publication_action(
     previous: &EpochStatus,
     proposed: &EpochStatus,
@@ -1307,6 +1405,16 @@ fn validate_epoch_status(status: &EpochStatus, expected_epoch: u64) -> Result<()
         "status object phase is invalid"
     );
     Ok(())
+}
+
+fn epoch_status_bytes(status: &EpochStatus) -> Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(status)?;
+    bytes.push(b'\n');
+    ensure!(
+        bytes.len() <= MAX_STATUS_BYTES as usize,
+        "status payload is oversized"
+    );
+    Ok(bytes)
 }
 
 fn write_status_receipt(directory: &Path, receipt: &StatusPublicationReceipt) -> Result<PathBuf> {
@@ -1385,12 +1493,7 @@ async fn status_publish(
         phase: config.phase.clone().expect("validated"),
     };
     validate_epoch_status(&status, epoch)?;
-    let mut status_bytes = serde_json::to_vec_pretty(&status)?;
-    status_bytes.push(b'\n');
-    ensure!(
-        status_bytes.len() <= MAX_STATUS_BYTES as usize,
-        "status payload is oversized"
-    );
+    let status_bytes = epoch_status_bytes(&status)?;
     let key = format!("epoch-{epoch}.epoch-status.json");
     let previous = get_mutable_object(s3, &r2.bucket, &key).await?;
     let action = if let Some(previous) = &previous {
@@ -1400,6 +1503,11 @@ async fn status_publish(
     } else {
         StatusPublicationAction::Replace
     };
+    let checksum_key = format!("epoch-{epoch}.jet.sha256");
+    let sidecar_is_committed = remote_sidecar(s3, &r2.bucket, &checksum_key)
+        .await?
+        .is_some();
+    validate_status_publication_after_sidecar(action, sidecar_is_committed)?;
     if action == StatusPublicationAction::Replace {
         let content_md5 = BASE64_STANDARD.encode(Md5::digest(&status_bytes));
         let request = s3
@@ -1455,6 +1563,252 @@ async fn status_publish(
             .expect("status-publish requires receipt directory"),
         &receipt,
     )
+}
+
+fn status_deletion_receipt_path(directory: &Path, epoch: u64) -> PathBuf {
+    directory.join(format!("epoch-{epoch}.status-deletion.json"))
+}
+
+fn write_status_deletion_receipt(
+    directory: &Path,
+    receipt: &StatusDeletionReceipt,
+) -> Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    fs::set_permissions(
+        directory,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )?;
+    let final_path = status_deletion_receipt_path(directory, receipt.epoch);
+    if final_path.exists() {
+        let before = regular_identity(&final_path)?;
+        ensure!(
+            before.length <= MAX_STATUS_BYTES,
+            "status deletion receipt is oversized"
+        );
+        let existing: StatusDeletionReceipt = serde_json::from_slice(&fs::read(&final_path)?)?;
+        ensure!(
+            regular_identity(&final_path)? == before,
+            "status deletion receipt changed while read"
+        );
+        ensure!(
+            existing == *receipt,
+            "existing status deletion receipt differs"
+        );
+        return Ok(final_path);
+    }
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!(".epoch-{}.status-deletion.", receipt.epoch))
+        .suffix(".tmp")
+        .tempfile_in(directory)?;
+    temporary
+        .as_file_mut()
+        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), receipt)?;
+    temporary.as_file_mut().write_all(b"\n")?;
+    temporary.as_file_mut().sync_all()?;
+    temporary.persist_noclobber(&final_path).map_err(|error| {
+        anyhow!(
+            "failed to publish {}: {}",
+            final_path.display(),
+            error.error
+        )
+    })?;
+    File::open(directory)?.sync_all()?;
+    Ok(final_path)
+}
+
+fn read_bound_status_publication_receipt(
+    directory: &Path,
+    path: &Path,
+    expected_sha256: &str,
+    bucket: &str,
+    epoch: u64,
+) -> Result<(StatusPublicationReceipt, String)> {
+    let bytes = read_stable_bounded(path, MAX_STATUS_BYTES, "status publication receipt")?;
+    let actual_sha256 = hex_lower(&Sha256::digest(&bytes));
+    ensure!(
+        actual_sha256 == expected_sha256,
+        "status publication receipt SHA-256 mismatch"
+    );
+    let receipt: StatusPublicationReceipt =
+        serde_json::from_slice(&bytes).context("invalid status publication receipt JSON")?;
+    ensure!(
+        receipt.schema == STATUS_RECEIPT_SCHEMA,
+        "unsupported status publication receipt schema"
+    );
+    ensure!(
+        receipt.bucket == bucket,
+        "status receipt names a different bucket"
+    );
+    ensure!(
+        receipt.epoch == epoch,
+        "status receipt names a different epoch"
+    );
+    ensure!(
+        receipt.key == format!("epoch-{epoch}.epoch-status.json"),
+        "status receipt contains a noncanonical object key"
+    );
+    ensure!(
+        receipt.authenticated_readback,
+        "status receipt lacks authenticated readback"
+    );
+    ensure!(
+        !receipt.object_etag.is_empty(),
+        "status receipt has an empty object ETag"
+    );
+    validate_epoch_status(&receipt.status, epoch)?;
+    ensure!(
+        path == status_receipt_path(directory, &receipt.status),
+        "status publication receipt path is noncanonical"
+    );
+    Ok((receipt, actual_sha256))
+}
+
+async fn validate_authenticated_ready_pair(
+    client: &Client,
+    bucket: &str,
+    receipt: &Receipt,
+) -> Result<()> {
+    let remote = head_archive(client, bucket, &receipt.archive_key)
+        .await?
+        .ok_or_else(|| anyhow!("remote archive is missing"))?;
+    validate_remote_against_receipt(&remote, receipt)?;
+    ensure!(
+        remote_sidecar(client, bucket, &receipt.checksum_key)
+            .await?
+            .as_deref()
+            == Some(canonical_sidecar(receipt).as_slice()),
+        "remote checksum sidecar differs from the durable R2 receipt"
+    );
+    Ok(())
+}
+
+async fn status_delete(s3: &Client, r2: &R2Config, config: &Config, epoch: u64) -> Result<PathBuf> {
+    let status_receipt_directory = config
+        .receipt_directory
+        .as_deref()
+        .expect("status-delete requires receipt directory");
+    let status_publication_receipt = config
+        .status_publication_receipt
+        .as_deref()
+        .expect("validated");
+    let (publication, publication_sha256) = read_bound_status_publication_receipt(
+        status_receipt_directory,
+        status_publication_receipt,
+        config
+            .status_publication_sha256
+            .as_deref()
+            .expect("validated"),
+        &r2.bucket,
+        epoch,
+    )?;
+
+    let archive_receipt_directory = config
+        .archive_receipt_directory
+        .as_deref()
+        .expect("validated");
+    let archive_receipt_path = receipt_path(archive_receipt_directory, epoch);
+    let archive_receipt = read_restore_receipt(archive_receipt_directory, &r2.bucket, epoch)?;
+    ensure!(
+        archive_receipt.remote_sha256_readback || archive_receipt.r2_composite_sha256.is_some(),
+        "R2 receipt lacks a durable whole-object SHA-256 proof"
+    );
+    let archive_receipt_bytes = read_stable_bounded(
+        &archive_receipt_path,
+        MAX_STATUS_BYTES,
+        "archive R2 receipt",
+    )?;
+    let rebound_archive_receipt: Receipt = serde_json::from_slice(&archive_receipt_bytes)?;
+    ensure!(
+        rebound_archive_receipt == archive_receipt,
+        "archive R2 receipt changed between validation reads"
+    );
+    let archive_receipt_sha256 = hex_lower(&Sha256::digest(&archive_receipt_bytes));
+
+    validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?;
+
+    let key = format!("epoch-{epoch}.epoch-status.json");
+    let deletion_receipt_path = status_deletion_receipt_path(status_receipt_directory, epoch);
+    if deletion_receipt_path.exists() {
+        let bytes = read_stable_bounded(
+            &deletion_receipt_path,
+            MAX_STATUS_BYTES,
+            "status deletion receipt",
+        )?;
+        let existing: StatusDeletionReceipt = serde_json::from_slice(&bytes)?;
+        ensure!(
+            existing.schema == STATUS_DELETION_RECEIPT_SCHEMA
+                && existing.bucket == r2.bucket
+                && existing.epoch == epoch
+                && existing.key == key
+                && existing.deleted_object_etag == publication.object_etag
+                && existing.deleted_status == publication.status
+                && existing.status_publication_receipt == status_publication_receipt
+                && existing.status_publication_receipt_sha256 == publication_sha256
+                && existing.archive_receipt == archive_receipt_path
+                && existing.archive_receipt_sha256 == archive_receipt_sha256
+                && existing.archive_sha256 == archive_receipt.archive_sha256
+                && existing.archive_etag == archive_receipt.archive_etag
+                && existing.authenticated_ready_pair_before
+                && existing.authenticated_status_absent_after
+                && existing.authenticated_ready_pair_after,
+            "existing status deletion receipt differs from the bound completion evidence"
+        );
+        ensure!(
+            get_mutable_object(s3, &r2.bucket, &key).await?.is_none(),
+            "status object reappeared after its deletion receipt"
+        );
+        validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?;
+        return Ok(deletion_receipt_path);
+    }
+    let current = get_mutable_object(s3, &r2.bucket, &key).await?;
+    let conditional_delete_request_sent = if let Some(current) = current {
+        ensure!(
+            current.etag == publication.object_etag,
+            "current status ETag differs from the bound publication receipt"
+        );
+        ensure!(
+            current.bytes == epoch_status_bytes(&publication.status)?,
+            "current status bytes differ from the bound publication receipt"
+        );
+        s3.delete_object()
+            .bucket(&r2.bucket)
+            .key(&key)
+            .if_match(format!("\"{}\"", current.etag))
+            .send()
+            .await
+            .map_err(|error| anyhow!("conditional status deletion failed: {error:?}"))?;
+        true
+    } else {
+        false
+    };
+
+    ensure!(
+        get_mutable_object(s3, &r2.bucket, &key).await?.is_none(),
+        "status object still exists after deletion"
+    );
+    validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?;
+
+    let deletion_receipt = StatusDeletionReceipt {
+        schema: STATUS_DELETION_RECEIPT_SCHEMA.to_owned(),
+        bucket: r2.bucket.clone(),
+        epoch,
+        key,
+        deleted_object_etag: publication.object_etag,
+        deleted_status: publication.status,
+        status_publication_receipt: status_publication_receipt.to_path_buf(),
+        status_publication_receipt_sha256: publication_sha256,
+        archive_receipt: archive_receipt_path,
+        archive_receipt_sha256,
+        archive_sha256: archive_receipt.archive_sha256,
+        archive_etag: archive_receipt.archive_etag,
+        conditional_delete_request_sent,
+        authenticated_ready_pair_before: true,
+        authenticated_status_absent_after: true,
+        authenticated_ready_pair_after: true,
+        verified_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    };
+    write_status_deletion_receipt(status_receipt_directory, &deletion_receipt)
 }
 
 async fn head_archive(client: &Client, bucket: &str, key: &str) -> Result<Option<RemoteArchive>> {
@@ -2638,6 +2992,17 @@ async fn main() -> Result<()> {
         );
         return Ok(());
     }
+    if config.command == Command::StatusDelete {
+        let epoch = *config.epochs.first().expect("one status epoch validated");
+        let receipt_path = status_delete(&client, &r2, &config, epoch)
+            .await
+            .with_context(|| format!("epoch {epoch} status deletion failed"))?;
+        eprintln!(
+            "epoch {epoch}: status conditionally deleted after authenticated ready-pair proof, receipt {}",
+            receipt_path.display()
+        );
+        return Ok(());
+    }
     for &epoch in &config.epochs {
         match config.command {
             Command::RetireLocal => retire_verified_local_epoch(&client, &r2, &config, epoch)
@@ -2649,7 +3014,10 @@ async fn main() -> Result<()> {
             Command::Sync | Command::Verify => sync_epoch(&client, &r2, &config, epoch)
                 .await
                 .with_context(|| format!("epoch {epoch} R2 delivery failed"))?,
-            Command::Inventory | Command::PublicVerify | Command::StatusPublish => {
+            Command::Inventory
+            | Command::PublicVerify
+            | Command::StatusPublish
+            | Command::StatusDelete => {
                 unreachable!("read-only command handled above")
             }
         }
@@ -2826,6 +3194,105 @@ mod tests {
         assert!(status_publication_action(&status, &conflicting).is_err());
         older.epoch = 219;
         assert!(status_publication_action(&older, &status).is_err());
+        validate_status_publication_after_sidecar(StatusPublicationAction::Replace, false).unwrap();
+        assert!(
+            validate_status_publication_after_sidecar(StatusPublicationAction::Replace, true)
+                .is_err()
+        );
+        validate_status_publication_after_sidecar(StatusPublicationAction::RecoverReceipt, true)
+            .unwrap();
+    }
+
+    fn status_publication_receipt(epoch: u64) -> StatusPublicationReceipt {
+        StatusPublicationReceipt {
+            schema: STATUS_RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch,
+            key: format!("epoch-{epoch}.epoch-status.json"),
+            status: EpochStatus {
+                epoch,
+                jet_size_bytes: 123,
+                elapsed_execution_millis: 456,
+                estimated_remaining_millis: 789,
+                sampled_at_utc: "2026-10-17T01:10:00Z".to_owned(),
+                phase: "replay".to_owned(),
+            },
+            object_etag: "etag".to_owned(),
+            previous_object_etag: None,
+            observer_receipt: PathBuf::from("/private/observer.json"),
+            observer_receipt_sha256: "ab".repeat(32),
+            controller_invocation_id: "cd".repeat(16),
+            producer_invocation_id: "ef".repeat(16),
+            authenticated_readback: true,
+            verified_unix_seconds: 1,
+        }
+    }
+
+    #[test]
+    fn status_deletion_binds_the_exact_canonical_publication_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let receipt = status_publication_receipt(218);
+        let path = write_status_receipt(directory.path(), &receipt).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let digest = hex_lower(&Sha256::digest(&bytes));
+        let (read, read_digest) =
+            read_bound_status_publication_receipt(directory.path(), &path, &digest, "bucket", 218)
+                .unwrap();
+        assert_eq!(read, receipt);
+        assert_eq!(read_digest, digest);
+        assert!(
+            read_bound_status_publication_receipt(
+                directory.path(),
+                &path,
+                &"00".repeat(32),
+                "bucket",
+                218,
+            )
+            .is_err()
+        );
+        assert!(
+            read_bound_status_publication_receipt(directory.path(), &path, &digest, "other", 218,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn status_deletion_receipt_is_private_durable_and_no_clobber() {
+        let directory = tempfile::tempdir().unwrap();
+        let publication = status_publication_receipt(218);
+        let receipt = StatusDeletionReceipt {
+            schema: STATUS_DELETION_RECEIPT_SCHEMA.to_owned(),
+            bucket: "bucket".to_owned(),
+            epoch: 218,
+            key: publication.key.clone(),
+            deleted_object_etag: publication.object_etag.clone(),
+            deleted_status: publication.status.clone(),
+            status_publication_receipt: PathBuf::from("/private/status.json"),
+            status_publication_receipt_sha256: "01".repeat(32),
+            archive_receipt: PathBuf::from("/private/archive.json"),
+            archive_receipt_sha256: "02".repeat(32),
+            archive_sha256: "03".repeat(32),
+            archive_etag: "archive-etag".to_owned(),
+            conditional_delete_request_sent: true,
+            authenticated_ready_pair_before: true,
+            authenticated_status_absent_after: true,
+            authenticated_ready_pair_after: true,
+            verified_unix_seconds: 1,
+        };
+        let path = write_status_deletion_receipt(directory.path(), &receipt).unwrap();
+        assert_eq!(
+            path,
+            status_deletion_receipt_path(directory.path(), receipt.epoch)
+        );
+        assert_eq!(
+            fs::metadata(directory.path()).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        write_status_deletion_receipt(directory.path(), &receipt).unwrap();
+        let mut different = receipt;
+        different.archive_etag = "different".to_owned();
+        assert!(write_status_deletion_receipt(directory.path(), &different).is_err());
     }
 
     fn public_receipt(epoch: u64) -> PublicReceipt {
@@ -3220,15 +3687,25 @@ mod tests {
     }
 
     #[test]
-    fn source_has_no_completed_object_delete_operation() {
+    fn source_confines_remote_deletion_to_one_status_object_operation() {
         let source = include_str!("main.rs");
-        let forbidden = [concat!("delete_", "object"), concat!("delete_", "objects")];
-        for operation in forbidden {
-            assert!(
-                !source.contains(operation),
-                "forbidden R2 operation: {operation}"
-            );
-        }
+        let singular = concat!(".delete_", "object()");
+        let plural = concat!(".delete_", "objects()");
+        assert_eq!(source.matches(singular).count(), 1);
+        assert!(!source.contains(plural));
+        let start = source.find("async fn status_delete(").unwrap();
+        let end = source[start..].find("\nasync fn head_archive(").unwrap() + start;
+        let status_delete = &source[start..end];
+        assert!(status_delete.contains(singular));
+        assert!(status_delete.contains("format!(\"epoch-{epoch}.epoch-status.json\")"));
+        let ready_pair_before = status_delete
+            .find("validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?")
+            .unwrap();
+        let deletion = status_delete.find(singular).unwrap();
+        let ready_pair_after = status_delete
+            .rfind("validate_authenticated_ready_pair(s3, &r2.bucket, &archive_receipt).await?")
+            .unwrap();
+        assert!(ready_pair_before < deletion && deletion < ready_pair_after);
     }
 
     #[test]
