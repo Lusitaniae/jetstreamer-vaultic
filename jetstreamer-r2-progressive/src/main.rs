@@ -44,7 +44,7 @@ struct Config {
     uploader: PathBuf,
     horizon_directory: PathBuf,
     receipt_directory: PathBuf,
-    public_receipt_directory: PathBuf,
+    public_receipt_directory: Option<PathBuf>,
     first_epoch: u64,
     last_epoch: u64,
     poll_seconds: u64,
@@ -131,7 +131,7 @@ fn usage() -> ! {
         "usage: jetstreamer-r2-progressive UPLOADER HORIZON_DIRECTORY RECEIPT_DIRECTORY ",
         "FIRST_EPOCH LAST_EPOCH [--poll-seconds N] [--concurrency N] ",
         "[--legacy-part-size-mib N] [--delete-local] [--local-mutation-lock PATH] ",
-        "--public-receipt-directory DIR ",
+        "[--public-receipt-directory DIR] ",
         "--full-receipt-directory DIR --full-verifier-sha256 HASH[,HASH...] ",
         "--full-verifier-script-sha256 HASH[,HASH...] --plugin-receipt-directory DIR ",
         "--plugin-pipeline-sha256 HASH[,HASH...] ",
@@ -367,10 +367,9 @@ fn parse_args() -> Result<Config> {
     let uploader = absolute_existing_file(uploader, "uploader")?;
     let horizon_directory = absolute_existing_directory(horizon_directory, "Horizon directory")?;
     let receipt_directory = absolute_existing_directory(receipt_directory, "receipt directory")?;
-    let public_receipt_directory = absolute_existing_directory(
-        take_required(public_receipt_directory, "--public-receipt-directory")?,
-        "public receipt directory",
-    )?;
+    let public_receipt_directory = public_receipt_directory
+        .map(|directory| absolute_existing_directory(directory, "public receipt directory"))
+        .transpose()?;
     let full = Gate {
         directory: absolute_existing_directory(
             take_required(full_directory, "--full-receipt-directory")?,
@@ -699,9 +698,14 @@ fn adjacent_boundaries_allowed(config: &Config, epoch: u64, digest: &str) -> boo
         })
 }
 
-fn retirement_allowed(config: &Config, epoch: u64, digest: &str, public_read: bool) -> bool {
+fn retirement_allowed(
+    config: &Config,
+    epoch: u64,
+    digest: &str,
+    authenticated_readback: bool,
+) -> bool {
     config.delete_local
-        && public_read
+        && authenticated_readback
         && !config
             .defer_epochs
             .iter()
@@ -743,7 +747,7 @@ fn run_sync(config: &Config, epoch: u64, delete_local: bool) -> Result<()> {
     Ok(())
 }
 
-fn public_verify_command(config: &Config, epoch: u64) -> Command {
+fn public_verify_command(config: &Config, public_receipt_directory: &Path, epoch: u64) -> Command {
     let mut command = Command::new(&config.uploader);
     command
         .arg("public-verify")
@@ -751,19 +755,21 @@ fn public_verify_command(config: &Config, epoch: u64) -> Command {
         .arg("--epochs")
         .arg(format!("{epoch}-{epoch}"))
         .arg("--public-receipt-directory")
-        .arg(&config.public_receipt_directory);
+        .arg(public_receipt_directory);
     command
 }
 
 fn run_public_verify(config: &Config, epoch: u64) -> Result<bool> {
+    let public_receipt_directory = config
+        .public_receipt_directory
+        .as_deref()
+        .ok_or_else(|| anyhow!("public verification was not configured"))?;
     println!("epoch {epoch}: anonymous public verification started");
-    let status = public_verify_command(config, epoch)
+    let status = public_verify_command(config, public_receipt_directory, epoch)
         .status()
         .with_context(|| format!("failed to start public verifier for epoch {epoch}"))?;
     if !status.success() {
-        let receipt_path = config
-            .public_receipt_directory
-            .join(format!("epoch-{epoch}.public.json"));
+        let receipt_path = public_receipt_directory.join(format!("epoch-{epoch}.public.json"));
         if archive_metadata(&receipt_path)?.is_some() {
             bail!(
                 "public verification failed for epoch {epoch} with an existing public-read receipt: {}",
@@ -823,17 +829,18 @@ fn run(config: &Config) -> Result<()> {
                 evidence
             };
 
-            if !run_public_verify(config, epoch)? {
-                incomplete += 1;
-                continue;
+            if let Some(public_receipt_directory) = &config.public_receipt_directory {
+                if !run_public_verify(config, epoch)? {
+                    incomplete += 1;
+                    continue;
+                }
+                let public_receipt_path =
+                    public_receipt_directory.join(format!("epoch-{epoch}.public.json"));
+                ensure!(
+                    public_receipt_matches(&public_receipt_path, epoch, &r2_evidence),
+                    "epoch {epoch}: public-read receipt does not match the authenticated R2 receipt"
+                );
             }
-            let public_receipt_path = config
-                .public_receipt_directory
-                .join(format!("epoch-{epoch}.public.json"));
-            ensure!(
-                public_receipt_matches(&public_receipt_path, epoch, &r2_evidence),
-                "epoch {epoch}: public-read receipt does not match the authenticated R2 receipt"
-            );
 
             if let Some(pair) = &pair
                 && retirement_allowed(config, epoch, &pair.digest, true)
@@ -843,8 +850,14 @@ fn run(config: &Config) -> Result<()> {
         }
         if incomplete == 0 {
             println!(
-                "epochs {}-{}: every epoch is anonymously readable with matching R2 evidence",
-                config.first_epoch, config.last_epoch
+                "epochs {}-{}: every epoch has matching authenticated R2 evidence{}",
+                config.first_epoch,
+                config.last_epoch,
+                if config.public_receipt_directory.is_some() {
+                    " and anonymous readback"
+                } else {
+                    ""
+                }
             );
             return Ok(());
         }
@@ -915,7 +928,7 @@ mod tests {
             uploader,
             horizon_directory: root.join("horizon"),
             receipt_directory: root.join("receipts"),
-            public_receipt_directory: root.join("public-receipts"),
+            public_receipt_directory: Some(root.join("public-receipts")),
             first_epoch: 7,
             last_epoch: 7,
             poll_seconds: 1,
@@ -1051,6 +1064,38 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_only_mode_does_not_require_public_origin_evidence() {
+        let temporary = TempDir::new().unwrap();
+        let mut config = test_config(temporary.path());
+        config.public_receipt_directory = None;
+        let checksum = digest("a");
+        let verifier = digest("c");
+        let script = digest("e");
+        fs::write(
+            config.full.directory.join("epoch-7.full.ok"),
+            format!("{checksum} {verifier} {script}\n"),
+        )
+        .unwrap();
+        fs::write(
+            config.plugin.directory.join("epoch-7.plugin.ok"),
+            format!("{checksum} {verifier} {script}\n"),
+        )
+        .unwrap();
+        fs::write(
+            config.boundary.directory.join("boundary-6-7.ok"),
+            format!("{} {checksum} {verifier} {script}\n", digest("0")),
+        )
+        .unwrap();
+        fs::write(
+            config.boundary.directory.join("boundary-7-8.ok"),
+            format!("{checksum} {} {verifier} {script}\n", digest("1")),
+        )
+        .unwrap();
+        assert!(publication_allowed(&config, 7, &checksum));
+        assert!(retirement_allowed(&config, 7, &checksum, true));
+    }
+
+    #[test]
     fn delete_local_is_delegated_to_rust_uploader() {
         let temporary = TempDir::new().unwrap();
         let config = test_config(temporary.path());
@@ -1067,7 +1112,8 @@ mod tests {
     fn public_verification_is_delegated_to_rust_uploader() {
         let temporary = TempDir::new().unwrap();
         let config = test_config(temporary.path());
-        let command = public_verify_command(&config, 7);
+        let public_receipt_directory = config.public_receipt_directory.as_deref().unwrap();
+        let command = public_verify_command(&config, public_receipt_directory, 7);
         let arguments: Vec<_> = command
             .get_args()
             .map(|value| value.to_string_lossy().into_owned())
@@ -1080,10 +1126,7 @@ mod tests {
                 "--epochs".to_owned(),
                 "7-7".to_owned(),
                 "--public-receipt-directory".to_owned(),
-                config
-                    .public_receipt_directory
-                    .to_string_lossy()
-                    .into_owned(),
+                public_receipt_directory.to_string_lossy().into_owned(),
             ]
         );
         assert_eq!(command.get_program(), config.uploader.as_os_str());
