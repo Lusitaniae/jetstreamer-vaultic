@@ -69,8 +69,8 @@ struct Authority {
 
 #[derive(Debug, Deserialize)]
 struct Validation {
-    #[serde(rename = "reproduces_2026_10_17T04_17_00Z_statuses_to_nearest_second")]
-    reproduces_2026_10_17_t04_17_00_z_statuses_to_nearest_second: bool,
+    #[serde(rename = "matches_2026_10_17T04_17_00Z_statuses_within_one_second")]
+    matches_2026_10_17_t04_17_00_z_statuses_within_one_second: bool,
     #[serde(rename = "reproduces_2026_10_17T04_47_00Z_statuses_exactly")]
     reproduces_2026_10_17_t04_47_00_z_statuses_exactly: bool,
 }
@@ -283,7 +283,7 @@ fn validate_model(model: &Model) -> Result<()> {
     ensure!(
         model
             .validation
-            .reproduces_2026_10_17_t04_17_00_z_statuses_to_nearest_second
+            .matches_2026_10_17_t04_17_00_z_statuses_within_one_second
             && model
                 .validation
                 .reproduces_2026_10_17_t04_47_00_z_statuses_exactly,
@@ -681,6 +681,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![132_452_000, 134_894_000, 466_536_000, 468_978_000]
         );
+    }
+
+    #[test]
+    fn reproduces_previous_sample_for_both_lanes() {
+        let cases = [
+            (
+                RangeModel {
+                    range: "216-219".to_string(),
+                    expected_controller_invocation_id: "2b6ded8d8baf4f72a5c8a91385f7c278"
+                        .to_string(),
+                    expected_producer_invocation_id: "95fb05d1b78349bcb907c1e930e7682e".to_string(),
+                    epochs: vec![216, 217, 218, 219],
+                    terminal_slot: 94_175_999,
+                    current_completion_overhead_seconds: 10_230,
+                    second_epoch_commit_offset_seconds: 2_442,
+                    next_pair_replay_seconds: 347_843,
+                    formula: (216..=219)
+                        .map(|epoch| (epoch.to_string(), "bound".to_string()))
+                        .collect(),
+                },
+                94_140_628,
+                2.759349388074035,
+                vec![23_048_000, 25_490_000, 370_891_000, 373_333_000],
+            ),
+            (
+                RangeModel {
+                    range: "220-223".to_string(),
+                    expected_controller_invocation_id: "0b69b5009dc74bbda94b94d059a3daa7"
+                        .to_string(),
+                    expected_producer_invocation_id: "c2adebaad0cb42b385156631156813fe".to_string(),
+                    epochs: vec![220, 221, 222, 223],
+                    terminal_slot: 95_903_999,
+                    current_completion_overhead_seconds: 8_779,
+                    second_epoch_commit_offset_seconds: 2_442,
+                    next_pair_replay_seconds: 334_084,
+                    formula: (220..=223)
+                        .map(|epoch| (epoch.to_string(), "bound".to_string()))
+                        .collect(),
+                },
+                95_588_448,
+                2.5660109198403633,
+                vec![131_752_000, 134_194_000, 465_836_000, 468_278_000],
+            ),
+        ];
+        for (model, slot, rate, expected) in cases {
+            let replay = Replay {
+                range: model.range.clone(),
+                controller_after: unit(&model.expected_controller_invocation_id),
+                producer_after: unit(&model.expected_producer_invocation_id),
+                useful_work: UsefulWork {
+                    last: Some(ProgressPoint {
+                        slot,
+                        terminal_slot: model.terminal_slot,
+                    }),
+                    slots_per_second: Some(rate),
+                    sufficient_for_rates: true,
+                },
+                invocation_binding_stable: true,
+            };
+            let (_, estimates) = estimate_range(&model, &replay).unwrap();
+            for (actual, expected) in estimates
+                .iter()
+                .map(|item| item.estimated_remaining_millis)
+                .zip(expected)
+            {
+                assert!(actual.abs_diff(expected) <= 1_000);
+            }
+        }
     }
 
     #[test]
