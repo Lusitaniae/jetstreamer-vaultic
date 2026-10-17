@@ -132,8 +132,9 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   with the reviewed, sealed Rust `jetstreamer-horizon-status-estimate` binary before calling
   `status-publish`. Bind the exact model, observer receipt, and running estimator SHA-256 values.
   The model must name the expected zero-restart controller and producer invocation IDs, its prior
-  evidence receipts, terminal slots, fixed post-replay/verification/upload allowances, and the
-  estimate for each queued epoch. The estimator must rehash that evidence, require the observer's
+  evidence receipts, exact archive directories, phase, private status-receipt directory, terminal
+  slots, fixed post-replay/verification/upload allowances, elapsed execution time, and the estimate
+  for each queued epoch. The estimator must rehash that evidence, require the observer's
   stable live identities and sufficient slot rates, and fsync a private no-clobber estimate receipt.
   Pass only the resulting integer millisecond values to the matching status publications. A missing
   rate, identity change, stale timestamp, model mismatch, or estimator failure publishes no
