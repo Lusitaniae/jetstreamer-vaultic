@@ -145,6 +145,15 @@ For a long-running range, use the repository's `jetstreamer-r2-progressive` Rust
   root-owned owner-only estimate directory, prior estimate receipts that reproduce the formula, and
   the exact coordinated observer receipt. Leave every excluded range's status objects unchanged;
   never weaken the census or relabel a post-replay range as rate-bearing merely to refresh it.
+- Once a legacy producer advances into a later epoch while its controller still withholds every
+  archive until whole-cohort import, stop using the pairwise legacy formula: a completed replay is
+  not yet a sidecar. Use the reviewed schema-v4 cohort-gated model instead. Bind the current epoch's
+  exact observed terminal slot, add every still-queued cohort slot to every epoch that cannot be
+  exposed before the shared import gate, and give each epoch an evidence-backed downstream
+  allowance for import, verification, upload, readback, and its position in sidecar commit order.
+  Require the per-epoch replay-offset and downstream-allowance maps to cover the modeled range
+  exactly. If that model is unavailable or its evidence is incomplete, leave the affected status
+  objects unchanged rather than publishing the old pairwise ETA.
 - Delete only that epoch's `epoch-N.epoch-status.json`, and only after the canonical `.jet` has been
   uploaded and read back, its `.sha256` sidecar has been created, and the complete pair has durable
   authenticated verification evidence. Status deletion does not wait for an anonymous public
