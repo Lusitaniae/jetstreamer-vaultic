@@ -18,11 +18,13 @@ epochs touch a slot interval marked unsupported by the checked-in runtime regist
    before transferring bytes, and retain that metadata in the restore receipt. Successful token
    refresh alone is insufficient because an otherwise authenticated download can still fail with
    `UserProjectMissing`.
-   Separately require `HORIZON_PUBLIC_BASE_URL` to be an enabled R2 `r2.dev` hostname or custom
-   domain. Reject `*.r2.cloudflarestorage.com`: it is the authenticated S3 API surface and cannot
-   be made public with an object ACL. Before accepting any existing or newly uploaded pair as
-   published, perform credential-free HTTPS GETs for both the archive and sidecar through the public
-   origin and bind the observed length and canonical sidecar bytes to authenticated R2 evidence.
+   Public access is a bucket-level R2 origin setting, not an object ACL or an archive-integrity
+   gate. Do not require `HORIZON_PUBLIC_BASE_URL`, an anonymous origin, or credential-free HTTPS
+   checks for replay admission, publication, status cleanup, or local retirement. Prove every
+   uploaded archive and sidecar through the authenticated R2 API and durable readback receipts.
+   If the user separately asks to expose the bucket, enable only the named bucket's managed origin
+   or custom domain through the control plane when authorized; never rewrite archive objects or
+   delay the authenticated campaign while waiting for a public URL.
 3. Keep public output in `${HORIZON_DIR:-$HOME/horizon}` and private runs, manifests, receipts,
    restore scratch, and controller state outside that directory. The public directory may contain
    only canonical `epoch-N.jet` and `epoch-N.jet.sha256` pairs. Before launching a service as an
