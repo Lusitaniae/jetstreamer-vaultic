@@ -983,7 +983,10 @@ Do not use `--legacy-etag-only` unless the user has explicitly established that 
   status turns. Let it run unattended and inspect it once the cadence interval has elapsed or its
   scheduled event should have completed. A user request for a status update always authorizes one
   immediate out-of-band replay/resource observation, even inside the normal 30-minute window; mark
-  it as user-requested in the resulting evidence and use it to refresh the status objects. Do not
+  its observer config with `"observation_reason": "user-requested-status"`, require the resulting
+  v2 receipt to record that reason and `routine_minimum_interval_enforced: false`, and use it to
+  refresh the status objects. Omit that config field, or set it to `routine`, for autonomous
+  observations so the observer enforces the 1,800-second predecessor interval. Do not
   turn that exception into an autonomous retry loop or additional unrequested polls. Diagnose an
   already-observed failure from existing evidence, but do not use it as a reason to restart or
   duplicate healthy work.

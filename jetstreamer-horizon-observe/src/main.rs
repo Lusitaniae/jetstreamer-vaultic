@@ -69,6 +69,14 @@ const MONOTONIC_MEMORY_STAT_COUNTERS: &[&str] = &[
     "zswpwb",
 ];
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum ObservationReason {
+    #[default]
+    Routine,
+    UserRequestedStatus,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -76,6 +84,8 @@ struct Config {
     previous_sample: PathBuf,
     minimum_interval_seconds: u64,
     not_before_utc: String,
+    #[serde(default)]
+    observation_reason: ObservationReason,
     filesystem_path: PathBuf,
     output: PathBuf,
     replays: Vec<ReplayConfig>,
@@ -317,6 +327,17 @@ fn now_unix() -> Result<u64> {
         .duration_since(UNIX_EPOCH)
         .context("system clock predates Unix epoch")?
         .as_secs())
+}
+
+fn effective_not_before(
+    cadence_not_before: u64,
+    configured_not_before: u64,
+    observation_reason: ObservationReason,
+) -> u64 {
+    match observation_reason {
+        ObservationReason::Routine => cadence_not_before.max(configured_not_before),
+        ObservationReason::UserRequestedStatus => configured_not_before,
+    }
 }
 
 fn format_utc(unix: u64) -> Result<String> {
@@ -1347,7 +1368,11 @@ fn run(config: Config) -> Result<()> {
         .checked_add(config.minimum_interval_seconds)
         .ok_or_else(|| anyhow!("cadence timestamp overflow"))?;
     let configured_not_before = parse_utc(&config.not_before_utc)?;
-    let effective_not_before = cadence_not_before.max(configured_not_before);
+    let effective_not_before = effective_not_before(
+        cadence_not_before,
+        configured_not_before,
+        config.observation_reason,
+    );
     ensure!(
         started_unix >= effective_not_before,
         "observation attempted before {}; previous successful sample interval is {interval} seconds",
@@ -1448,6 +1473,8 @@ fn run(config: Config) -> Result<()> {
         "recorded_at_utc": format_utc(started_unix)?,
         "completed_at_utc": format_utc(completed_unix)?,
         "cadence": {
+            "observation_reason": config.observation_reason,
+            "routine_minimum_interval_enforced": config.observation_reason == ObservationReason::Routine,
             "previous_sample": config.previous_sample,
             "previous_sample_recorded_at_utc": previous_timestamp,
             "previous_sample_sha256": sha256(&previous_bytes),
@@ -1496,6 +1523,53 @@ mod tests {
             "jetstreamer-horizon-live-resource-sample-config-v2"
         );
         assert_eq!(OUTPUT_SCHEMA, "jetstreamer-horizon-live-resource-sample-v2");
+    }
+
+    #[test]
+    fn routine_observation_enforces_the_cadence_floor() {
+        assert_eq!(
+            effective_not_before(2_800, 2_100, ObservationReason::Routine),
+            2_800
+        );
+        assert_eq!(
+            effective_not_before(2_800, 3_000, ObservationReason::Routine),
+            3_000
+        );
+    }
+
+    #[test]
+    fn explicit_user_status_observation_uses_only_its_not_before_gate() {
+        assert_eq!(
+            effective_not_before(2_800, 2_100, ObservationReason::UserRequestedStatus),
+            2_100
+        );
+    }
+
+    #[test]
+    fn observation_reason_defaults_to_routine_and_rejects_unknown_values() {
+        let base = serde_json::json!({
+            "schema": CONFIG_SCHEMA,
+            "previous_sample": "/tmp/previous.json",
+            "minimum_interval_seconds": 1800,
+            "not_before_utc": "2026-10-17T07:00:00Z",
+            "filesystem_path": "/",
+            "output": "/tmp/output.json",
+            "replays": []
+        });
+        let config: Config = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(config.observation_reason, ObservationReason::Routine);
+
+        let mut explicit = base.clone();
+        explicit["observation_reason"] = serde_json::json!("user-requested-status");
+        let config: Config = serde_json::from_value(explicit).unwrap();
+        assert_eq!(
+            config.observation_reason,
+            ObservationReason::UserRequestedStatus
+        );
+
+        let mut invalid = base;
+        invalid["observation_reason"] = serde_json::json!("automatic-bypass");
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
     }
 
     #[test]
