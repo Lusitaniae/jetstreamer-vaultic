@@ -51,6 +51,7 @@ struct RangeModel {
     range: String,
     expected_controller_invocation_id: String,
     expected_producer_invocation_id: String,
+    archive_directory: PathBuf,
     epochs: Vec<u64>,
     elapsed_execution_millis: u64,
     terminal_slot: u64,
@@ -139,6 +140,9 @@ struct RangeOutput {
 #[derive(Debug, Serialize)]
 struct EpochEstimate {
     epoch: u64,
+    archive_directory: String,
+    expected_controller_invocation_id: String,
+    expected_producer_invocation_id: String,
     elapsed_execution_millis: u64,
     estimated_remaining_millis: u64,
 }
@@ -315,6 +319,10 @@ fn validate_model(model: &Model) -> Result<()> {
             range.epochs.len() == 4,
             "modeled range must contain four epochs"
         );
+        ensure!(
+            range.archive_directory.is_absolute(),
+            "modeled archive directory is not absolute"
+        );
         ensure!(range.formula.len() == 4, "modeled range lacks formulas");
         ensure!(
             range.expected_controller_invocation_id.len() == 32
@@ -420,6 +428,9 @@ fn estimate_range(
         .map(|(epoch, seconds)| {
             Ok(EpochEstimate {
                 epoch: *epoch,
+                archive_directory: model.archive_directory.display().to_string(),
+                expected_controller_invocation_id: model.expected_controller_invocation_id.clone(),
+                expected_producer_invocation_id: model.expected_producer_invocation_id.clone(),
                 elapsed_execution_millis: model.elapsed_execution_millis,
                 estimated_remaining_millis: seconds
                     .checked_mul(1000)
@@ -512,6 +523,14 @@ fn run() -> Result<()> {
     let mut ranges = Vec::new();
     let mut estimates = Vec::new();
     for range_model in &model.ranges {
+        ensure!(
+            range_model.archive_directory.canonicalize()? == range_model.archive_directory,
+            "archive directory path is not exact"
+        );
+        ensure!(
+            fs::symlink_metadata(&range_model.archive_directory)?.is_dir(),
+            "archive directory is not a directory"
+        );
         let matches: Vec<_> = observer
             .replays
             .iter()
@@ -580,6 +599,7 @@ mod tests {
             range: "216-219".to_string(),
             expected_controller_invocation_id: controller.to_string(),
             expected_producer_invocation_id: producer.to_string(),
+            archive_directory: "/tmp/lane-216-output".into(),
             epochs: vec![216, 217, 218, 219],
             elapsed_execution_millis: 336_638_000,
             terminal_slot: 94_175_999,
@@ -610,6 +630,11 @@ mod tests {
                 .iter()
                 .all(|item| item.elapsed_execution_millis == 336_638_000)
         );
+        assert!(estimates.iter().all(|item| {
+            item.archive_directory == "/tmp/lane-216-output"
+                && item.expected_controller_invocation_id == controller
+                && item.expected_producer_invocation_id == producer
+        }));
         assert_eq!(
             estimates
                 .iter()
@@ -625,6 +650,7 @@ mod tests {
             range: "220-223".to_string(),
             expected_controller_invocation_id: "0".repeat(32),
             expected_producer_invocation_id: "1".repeat(32),
+            archive_directory: "/tmp/lane-220-output".into(),
             epochs: vec![220, 221, 222, 223],
             elapsed_execution_millis: 214_176_000,
             terminal_slot: 95_903_999,
@@ -660,6 +686,7 @@ mod tests {
             range: "220-223".to_string(),
             expected_controller_invocation_id: controller.to_string(),
             expected_producer_invocation_id: producer.to_string(),
+            archive_directory: "/tmp/lane-220-output".into(),
             epochs: vec![220, 221, 222, 223],
             elapsed_execution_millis: 214_176_000,
             terminal_slot: 95_903_999,
@@ -703,6 +730,7 @@ mod tests {
                     expected_controller_invocation_id: "2b6ded8d8baf4f72a5c8a91385f7c278"
                         .to_string(),
                     expected_producer_invocation_id: "95fb05d1b78349bcb907c1e930e7682e".to_string(),
+                    archive_directory: "/tmp/lane-216-output".into(),
                     epochs: vec![216, 217, 218, 219],
                     elapsed_execution_millis: 334_838_000,
                     terminal_slot: 94_175_999,
@@ -723,6 +751,7 @@ mod tests {
                     expected_controller_invocation_id: "0b69b5009dc74bbda94b94d059a3daa7"
                         .to_string(),
                     expected_producer_invocation_id: "c2adebaad0cb42b385156631156813fe".to_string(),
+                    archive_directory: "/tmp/lane-220-output".into(),
                     epochs: vec![220, 221, 222, 223],
                     elapsed_execution_millis: 212_376_000,
                     terminal_slot: 95_903_999,
